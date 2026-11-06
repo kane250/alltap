@@ -50,7 +50,13 @@ mkpkg() {
     if [ "$rc" != 0 ]; then
         echo "---- makepkg 失败日志 (uid=$(id -u)) ----"
         tail -30 "$OUT/makepkg.log"
-        echo "------------------------------------------"
+        echo "---- 环境诊断 ----"
+        id nobody 2>&1 || true
+        ls -ld /tmp "$OUT" "${d%/*}" "$d" 2>&1 || true
+        runuser -u nobody -- ls -ld "$d" 2>&1 || true
+        runuser -u nobody -- env HOME=/tmp passwd --status 2>/dev/null || true
+        runuser -u nobody -- env HOME=/tmp bash -c 'cd "$1" && pwd -P && id && stat -c "%U %a" .' _ "$d" 2>&1 || true
+        echo "------------------"
     fi
     return $rc
 }
