@@ -1,0 +1,2441 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+alltap — 把 (几乎) 所有 Linux 软件包转换成 Arch Linux 软件包
+
+支持输入格式:
+  .deb          Debian / Ubuntu / 深度 / UOS 等
+  .rpm          Fedora / RHEL / openSUSE 等 (纯 Python 解析, 无需 rpm 工具)
+  .apk          Alpine Linux
+  .tgz/.txz     Slackware
+  .AppImage     通用 AppImage (重打包到 /opt)
+  .tar.gz/.xz/..通用归档 (自动判定: 含 usr/ 等系统树则直接入包, 否则装 /opt)
+  .pkg.tar.zst  Arch 包本身 (重打包 & 元数据修正)
+
+输出:
+  默认:  直接生成可 pacman -U 安装的 .pkg.tar.zst
+  -p :   仅生成 PKGBUILD (debtap 兼容模式)
+
+外部依赖: python3 >= 3.9, bsdtar (libarchive), zstd/xz/bzip2/gzip (按需)
+"""
+
+import argparse
+import bz2
+import glob as _glob
+import gzip
+import hashlib
+import json
+import lzma
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+PROG = "alltap"
+VERSION = "1.1.0"
+
+# ---------------------------------------------------------------------------
+# 通用小工具
+# ---------------------------------------------------------------------------
+
+class Log:
+    def __init__(self):
+        self.quiet = False
+        self.verbose = False
+
+    def info(self, msg):
+        if not self.quiet:
+            print(msg)
+
+    def verb(self, msg):
+        if self.verbose and not self.quiet:
+            print("    " + msg)
+
+    def warn(self, msg):
+        if not self.quiet:
+            print(f"  警告: {msg}", file=sys.stderr)
+
+    def drop_list(self, kind, items):
+        """收集被丢弃/未翻译的条目, 退出前统一提示"""
+        if items and not self.quiet:
+            print(f"  注意: 以下 {kind} 已被{ '剔除' if kind.startswith('依赖') else '忽略' }: {', '.join(sorted(set(items)))}")
+
+log = Log()
+
+
+def die(msg, code=1):
+    print(f"错误: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, **kw):
+    """执行外部命令, 失败抛异常"""
+    log.verb("$ " + " ".join(cmd))
+    return subprocess.run(cmd, check=True, capture_output=True, text=False, **kw)
+
+
+def which(cmd):
+    return shutil.which(cmd) is not None
+
+# ---------------------------------------------------------------------------
+# 元数据模型
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Dep:
+    """一条依赖: name + 可选比较符/版本"""
+    name: str
+    op: Optional[str] = None    # < <= = >= >
+    ver: Optional[str] = None
+
+    def to_pacman(self):
+        return f"{self.name}{self.op or ''}{self.ver or ''}"
+
+
+@dataclass
+class Metadata:
+    name: str = "unknown"
+    epoch: str = ""
+    version: str = "1.0"
+    release: str = "1"
+    desc: str = "(无描述)"
+    long_desc: str = ""
+    arch: str = "x86_64"
+    url: str = ""
+    license: str = "unknown"
+    depends: List[Dep] = field(default_factory=list)
+    optdepends: List[str] = field(default_factory=list)   # 已是 "pkg: 说明" 形式
+    provides: List[str] = field(default_factory=list)
+    conflicts: List[str] = field(default_factory=list)
+    replaces: List[str] = field(default_factory=list)
+    scripts: Dict[str, str] = field(default_factory=dict)  # .INSTALL 函数名 -> 函数体
+    source_fmt: str = ""
+
+    @property
+    def fullver(self):
+        e = f"{self.epoch}:" if self.epoch else ""
+        return f"{e}{self.version}-{self.release}"
+
+    @property
+    def pkgfilename(self):
+        return f"{self.name}-{self.fullver}-{self.arch}.pkg.tar.zst"
+
+
+def sanitize_pkgname(name: str) -> str:
+    n = name.lower().strip()
+    n = re.sub(r"\s+", "-", n)
+    n = re.sub(r"[^a-z0-9@._+\-]", "", n)
+    n = n.lstrip(".-")
+    return n or "pkg"
+
+
+def sanitize_ver(v: str) -> str:
+    """pacman:版本段不得含 '-', 允许 [A-Za-z0-9_.+:]; 不得以 '.'/'-' 开头"""
+    v = v.strip().replace(" ", "_")
+    v = re.sub(r"[^A-Za-z0-9_.+]", "_", v)
+    v = v.lstrip(".-_")
+    return v or "1"
+
+
+def sanitize_rel(r: str) -> str:
+    """pkgrel 规范化为 makepkg 要求的 integer[.integer];
+    ubuntu 后缀(如 2ubuntu1)转成 2.1, 其余非数字字符丢弃"""
+    r = r.strip()
+    m = re.match(r"^(\d+)", r)
+    if not m:
+        return "1"
+    main = m.group(1)
+    rest = r[m.end():]
+    mm = re.search(r"(\d+)", rest)
+    sub = mm.group(1) if mm else ""
+    return main + ("." + sub if sub else "")
+
+# ---------------------------------------------------------------------------
+# ar 归档解析 (用于 .deb)
+# ---------------------------------------------------------------------------
+
+def parse_ar(path: str) -> List[Tuple[str, bytes]]:
+    data = open(path, "rb").read()
+    if data[:8] != b"!<arch>\n":
+        raise ValueError("不是合法的 ar 归档 (deb?)")
+    members = []
+    pos = 8
+    while pos + 60 <= len(data):
+        hdr = data[pos:pos + 60]
+        name = hdr[0:16].decode("latin1").rstrip()
+        name = name.rstrip("/")
+        size = int(hdr[48:58].decode("latin1").split()[0])
+        body = data[pos + 60: pos + 60 + size]
+        members.append((name, body))
+        pos += 60 + size
+        if pos & 1:
+            pos += 1
+    return members
+
+# ---------------------------------------------------------------------------
+# bsdtar 封装
+# ---------------------------------------------------------------------------
+
+def bsdtar_extract(archive: str, dest: str, exclude_prefixes: List[str] = None):
+    if not which("bsdtar"):
+        die("缺少 bsdtar (libarchive), 请先安装: sudo pacman -S libarchive")
+    os.makedirs(dest, exist_ok=True)
+    cmd = ["bsdtar", "-xf", archive, "-C", dest]
+    for ex in (exclude_prefixes or []):
+        cmd += ["--exclude", ex]
+    run(cmd)
+
+
+def bsdtar_list(archive: str) -> List[str]:
+    out = run(["bsdtar", "-tf", archive])
+    return [ln for ln in out.stdout.decode("utf8", "replace").splitlines() if ln.strip()]
+
+# ---------------------------------------------------------------------------
+# cpio(newc) 解析 — 用于 RPM payload, 纯 Python
+# ---------------------------------------------------------------------------
+
+CPIO_MAGIC = (b"070701", b"070702")
+
+
+class CpioEntry:
+    __slots__ = ("mode", "filepath", "target", "data", "islnk", "isdir", "isreg")
+
+
+def extract_cpio_newc(stream, destdir: str):
+    """stream: 已解压的二进制流. 按条目解到 destdir (绝对路径防穿越)"""
+    count = 0
+    while True:
+        hdr = stream.read(110)
+        if len(hdr) < 110:
+            break
+        if hdr[:6] not in CPIO_MAGIC:
+            raise ValueError(f"非法 cpio 头: {hdr[:6]!r}")
+        f = [int(hdr[6 + i * 8: 6 + (i + 1) * 8], 16) for i in range(13)]
+        (_ino, mode, _uid, _gid, _nlink, _mtime, filesize,
+         _devmaj, _devmin, _rmaj, _rmin, namesize, _chk) = f
+        name = stream.read(namesize - 1).decode("utf8", "replace")
+        stream.read(1)  # NUL
+        pad = (110 + namesize) & 3
+        if pad:
+            stream.read(4 - pad)
+        data = stream.read(filesize)
+        pad = filesize & 3
+        if pad:
+            stream.read(4 - pad)
+        if name == "TRAILER!!!":
+            break
+        # 防路径穿越
+        name = name.lstrip("./")
+        if not name or ".." in name.split("/"):
+            continue
+        target = os.path.join(destdir, name)
+        ftype = mode & 0o170000
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if ftype == 0o040000:                       # 目录
+            os.makedirs(target, exist_ok=True)
+        elif ftype == 0o120000:                     # 符号链接
+            linkto = data.decode("utf8", "replace")
+            if os.path.lexists(target):
+                os.remove(target)
+            os.symlink(linkto, target)
+        elif ftype == 0o100000:                     # 普通文件
+            with open(target, "wb") as fp:
+                fp.write(data)
+            # 恢复权限位 (去掉高位类型位)
+            try:
+                os.chmod(target, mode & 0o7777)
+            except OSError:
+                pass
+        else:                                        # 设备/管道/套接字: 忽略
+            log.verb(f"跳过非常规 cpio 条目: {name} (type={oct(ftype)})")
+        count += 1
+    return count
+
+# ---------------------------------------------------------------------------
+# RPM 解析 — lead + 签名 header + 主 header + payload
+# ---------------------------------------------------------------------------
+
+RPM_TAGS = {
+    "NAME": 1000, "VERSION": 1001, "RELEASE": 1002, "EPOCH": 1003,
+    "SUMMARY": 1004, "DESCRIPTION": 1005, "LICENSE": 1014, "PACKAGER": 1015,
+    "URL": 1020, "ARCH": 1022,
+    "PREIN": 1023, "POSTIN": 1024, "PREUN": 1025, "POSTUN": 1026,
+    "SOURCERPM": 1044, "RPMVERSION": 1064,
+    "PROVIDENAME": 1047, "REQUIREFLAGS": 1048, "REQUIRENAME": 1049,
+    "REQUIREVERSION": 1050,
+    "CONFLICTFLAGS": 1053, "CONFLICTNAME": 1054, "CONFLICTVERSION": 1055,
+    "OBSOLETENAME": 1090, "PROVIDEFLAGS": 1112, "PROVIDEVERSION": 1113,
+    "OBSOLETEFLAGS": 1114, "OBSOLETEVERSION": 1115,
+    "PAYLOADFORMAT": 1124, "PAYLOADCOMPRESSOR": 1125,
+    "PRETRANS": 1151, "POSTTRANS": 1152,
+    "PREINPROG": 1085, "POSTINPROG": 1086, "PREUNPROG": 1087, "POSTUNPROG": 1088,
+    "RECOMMENDNAME": 5046, "RECOMMENDFLAGS": 5048, "RECOMMENDVERSION": 5047,
+    "SUGGESTNAME": 5049,
+}
+T = RPM_TAGS
+
+
+def _rpm_read_header(f) -> Tuple[list, bytes]:
+    """从文件流读一个 RPM header(内部工具, 调试用)"""
+    magic = f.read(8)
+    if magic != b"\x8e\xad\xe8\x01\x01\x00\x00\x00":
+        raise ValueError("非法 RPM header magic")
+    (nindex, hsize) = struct.unpack(">II", f.read(8))
+    entries = []
+    for _ in range(nindex):
+        tag, typ, off, cnt = struct.unpack(">IIII", f.read(16))
+        entries.append((tag, typ, off, cnt))
+    store = f.read(hsize)
+    return entries, store
+
+
+def _rpm_entry_value(typ, cnt, off, store):
+    """按 rpm tag 类型从 store 中读取值 (offset 由 writer 按类型对齐)"""
+    if typ in (6, 8, 9):    # STRING / STRING_ARRAY / I18NSTRING
+        vals = []
+        p = off
+        n = 1 if typ == 6 else cnt
+        for _ in range(n):
+            e = store.find(b"\0", p)
+            vals.append(store[p:e].decode("utf8", "replace"))
+            p = e + 1
+        return vals[0] if typ == 6 else vals
+    if typ == 1:
+        return store[off:off + cnt]
+    if typ == 2:   # CHAR / int8
+        return list(store[off:off + cnt])
+    if typ == 3:
+        return list(struct.unpack(f">{cnt}h", store[off:off + cnt * 2]))
+    if typ == 4:
+        return list(struct.unpack(f">{cnt}i", store[off:off + cnt * 4]))
+    if typ == 5:
+        return list(struct.unpack(f">{cnt}q", store[off:off + cnt * 8]))
+    if typ == 7:   # BIN
+        return store[off:off + cnt]
+    raise ValueError(f"未知 rpm tag 类型 {typ}")
+
+
+class RpmInfo:
+    def __init__(self, fields, payload_to, compressor):
+        self.f = fields                       # {tag号: 值}
+        self.payload_to = payload_to          # callable(dest) -> 解出文件数量
+        self.compressor = compressor
+
+
+def parse_rpm(path: str) -> RpmInfo:
+    """lead(96) + 签名 header(按 8 字节对齐) + 主 header + 压缩 cpio payload"""
+    import io
+    data = open(path, "rb").read()
+    if data[:4] != b"\xed\xab\xee\xdb":
+        raise ValueError("非法 RPM lead magic")
+    pos = 96  # lead 长度固定 96
+
+    def read_header(pos0):
+        magic = data[pos0:pos0 + 4]   # rpm 4.24+ 尾部 version/reserved 字节有差异, 只校验前 4 字节
+        if magic != b"\x8e\xad\xe8\x01":
+            raise ValueError("非法 RPM header magic")
+        nindex, hsize = struct.unpack(">II", data[pos0 + 8:pos0 + 16])
+        entries = []
+        p = pos0 + 16
+        for _ in range(nindex):
+            tag, typ, off, cnt = struct.unpack(">IIII", data[p:p + 16])
+            entries.append((tag, typ, off, cnt))
+            p += 16
+        store = data[p:p + hsize]
+        return entries, store, p + hsize
+
+    # 签名 header 后按 8 字节(绝对文件偏移)对齐到主 header
+    _se, _ss, spos = read_header(pos)
+    spos += (8 - (spos % 8)) % 8
+    entries, store, pend = read_header(spos)
+
+    fields = {}
+    for (tag, typ, off, cnt) in entries:
+        try:
+            fields[tag] = _rpm_entry_value(typ, cnt, off, store)
+        except Exception as e:
+            log.verb(f"rpm tag {tag} 解析失败: {e}")
+
+    compressor = fields.get(T["PAYLOADCOMPRESSOR"], "gzip")
+    payload_raw = data[pend:]
+
+    def payload_to(dest: str) -> int:
+        if compressor == "gzip":
+            stream = gzip.GzipFile(fileobj=io.BytesIO(payload_raw))
+        elif compressor in ("xz", "lzma"):
+            stream = lzma.LZMAFile(io.BytesIO(payload_raw))
+        elif compressor == "bzip2":
+            stream = bz2.BZ2File(io.BytesIO(payload_raw))
+        elif compressor.startswith("zstd"):
+            if not which("zstd"):
+                die("RPM payload 为 zstd 压缩, 需要 zstd 工具")
+            proc = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE)
+            out, _ = proc.communicate(payload_raw)
+            stream = io.BytesIO(out)
+        else:
+            die(f"不支持的 RPM payload 压缩: {compressor}")
+        return extract_cpio_newc(stream, dest)
+
+    return RpmInfo(fields, payload_to, compressor)
+
+
+# rpm 依赖 flags (rpmds.h)
+RPMSENSE_LESS, RPMSENSE_GREATER, RPMSENSE_EQUAL = 2, 4, 8
+
+
+def rpm_sense_to_op(flags: int) -> Optional[str]:
+    s = flags & 0xF
+    if s == RPMSENSE_EQUAL:
+        return "="
+    if s == RPMSENSE_LESS:
+        return "<"
+    if s == RPMSENSE_GREATER:
+        return ">"
+    if s == (RPMSENSE_LESS | RPMSENSE_GREATER):
+        return None   # <> 范围, pacman 无法表达, 视作无版本
+    if s == (RPMSENSE_LESS | RPMSENSE_EQUAL):
+        return "<="
+    if s == (RPMSENSE_GREATER | RPMSENSE_EQUAL):
+        return ">="
+    return None
+
+# ---------------------------------------------------------------------------
+# 格式探测
+# ---------------------------------------------------------------------------
+
+def detect_format(path: str) -> str:
+    fn = os.path.basename(path).lower()
+    with open(path, "rb") as f:
+        head = f.read(0x4000)
+
+    # --- magic 判定优先 ---
+    if head.startswith(b"\xed\xab\xee\xdb"):
+        return "rpm"
+    if head[:8] == b"!<arch>\n":
+        return "deb"
+    # .dtb? no. Alpine apk: gzip 流且成员名以 .PKGINFO/.SIGN 开头
+    is_gz = head[:2] == b"\x1f\x8b"
+    is_xz = head[:6] == b"\xfd7zXZ\x00"
+    is_bz2 = head[:3] == b"BZh"
+    is_zst = head[:4] == b"\x28\xb5\x2f\xfd"
+
+    # AppImage: ELF 且文件名 .AppImage
+    if head[:4] == b"\x7fELF" and fn.endswith(".appimage"):
+        return "appimage"
+
+    if is_gz or is_xz or is_bz2 or is_zst or head[:8] == b"ustar  \0" or head[:8] == b"ustar\x0000":
+        if fn.endswith(".apk"):
+            return "apk"
+        # Arch 包按文件名优先判定 (避免与 apk 的 .PKGINFO 首成员混淆)
+        if fn.endswith((".pkg.tar.zst", ".pkg.tar.xz", ".pkg.tar.gz", ".pkg.tar")):
+            return "archpkg"
+        # 看归档首条目判断类型
+        names = []
+        try:
+            names = bsdtar_list(path)
+        except Exception:
+            pass
+        firsts = {os.path.basename(n) for n in names[:8]}
+        apk_like = any(n.startswith(".SIGN.") for n in names[:8]) or (
+            ".PKGINFO" in firsts and names[:1] and names[0] == ".PKGINFO")
+        arch_like = ".MTREE" in firsts or ".MTREE" in names[:3]
+        if arch_like:
+            return "archpkg"
+        if apk_like:
+            return "apk"
+        if any(n.split("/")[0] == "install" for n in names) and re.search(r"-[^-]+-[^-]+-\d+\.(tgz|txz)$", fn, re.I):
+            return "slack"
+        # tarball: 系统树 or 普通归档
+        return "tarball"
+    if head == b"" :
+        die(f"空文件: {path}")
+    # 未压缩 tar?
+    if head[:8] in (b"ustar  \0", b"ustar\x0000"):
+        return "tarball"
+    if fn.endswith(".appimage"):
+        return "appimage"
+    die(f"无法识别的包格式: {path}\n支持: .deb .rpm .apk .tgz/.txz .AppImage .tar.* .pkg.tar.zst")
+
+# ---------------------------------------------------------------------------
+# 依赖翻译引擎
+# ---------------------------------------------------------------------------
+
+def find_map_file() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in [
+        os.environ.get("ALLTAP_MAP", ""),          # 显式指定
+        os.path.join(here, "data", "dep-map.conf"), # 开发目录结构
+        os.path.join(here, "..", "..", "share", "alltap", "dep-map.conf"),   # usr/bin->usr/share 结构
+        os.path.join(here, "..", "share", "alltap", "dep-map.conf"),             # 单级 bin->share
+        os.path.expanduser("~/.local/share/alltap/dep-map.conf"),
+        "/usr/share/alltap/dep-map.conf",
+        "/usr/local/share/alltap/dep-map.conf",
+    ]:
+        if cand and os.path.exists(cand):
+            return os.path.normpath(cand)
+    return ""
+
+
+# 内置兜底映射 (极小子集; data/dep-map.conf 更全)
+EMBEDDED_MAP = r"""
+@regex ^lib(LLVM|clang)\d+.*$ => llvm-libs
+@regex ^(lib)?icu\d+$ => icu
+@regex ^xmlto$ =>
+libc6 => glibc
+libc6-dev => glibc
+libcrypt1 => libcrypt
+libgcc-s1 => gcc-libs
+libgcc1 => gcc-libs
+libstdc\+\+6 => gcc-libs
+libssl3 => openssl
+zlib1g => zlib
+liblzma5 => xz
+libzstd1 => zstd
+libbz2-1.0 => bzip2
+libtinfo6 => ncurses
+libncursesw6 => ncurses
+libncurses6 => ncurses
+libreadline8 => readline
+libexpat1 => expat
+libffi8 => libffi
+libglib2.0-0 => glib2
+libgtk-3-0 => gtk3
+libgtk-2?\.0-0 => gtk2
+libx11-6 => libx11
+libxcb1 => libxcb
+libcurl4 => curl
+libxml2 => libxml2
+libsystemd0 => systemd-libs
+libudev1 => systemd-libs
+@drop debconf
+@drop dpkg
+@drop install-info
+@drop libc-bin
+@drop init-system-helpers
+@drop base-files
+@drop adduser
+@drop usr-is-merged
+"""
+
+
+def load_rules(path: str):
+    """语法: '原名 => arch名' / '@regex re => arch名' / '@drop 名'"""
+    plain, regexes, drops = {}, [], set()
+    text = open(path, encoding="utf8").read() if path else EMBEDDED_MAP
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("@drop"):
+            for x in line.split()[1:]:
+                drops.add(x.strip("'\""))
+            continue
+        if line.startswith("@regex"):
+            body = line[len("@regex"):].strip()
+            m = re.match(r"^(.*?)\s*=>\s*(.*)$", body)
+            if m:
+                regexes.append((re.compile(m.group(1)), m.group(2).strip().strip("'\"")))
+            continue
+        m = re.match(r"^(\S+)\s*(?:=>\s*(\S*))$", line)
+        if m:
+            plain[m.group(1)] = (m.group(2) or "").strip()
+    return plain, regexes, drops
+
+
+ARCH_REPOS_CACHE = None
+
+def arch_repo_names() -> set:
+    """当前系统仓库里全部包名 (pacman -Slq)"""
+    global ARCH_REPOS_CACHE
+    if ARCH_REPOS_CACHE is not None:
+        return ARCH_REPOS_CACHE
+    cache = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+                         "alltap", "arch-repo-names.txt")
+    names = set()
+    try:
+        if os.path.exists(cache) and time.time() - os.path.getmtime(cache) < 7 * 86400:
+            names = set(open(cache).read().split())
+        elif which("pacman"):
+            out = subprocess.run(["pacman", "-Slq"], capture_output=True, text=True)
+            if out.returncode == 0:
+                names = set(out.stdout.split())
+                os.makedirs(os.path.dirname(cache), exist_ok=True)
+                open(cache, "w").write("\n".join(sorted(names)))
+    except Exception as e:
+        log.verb(f"获取 Arch 仓库包名失败: {e}")
+    ARCH_REPOS_CACHE = names
+    return names
+
+
+class Translator:
+    def __init__(self, opts):
+        self.opts = opts
+        mfile = find_map_file()
+        self.plain, self.regexes, self.drops = load_rules(mfile)
+        if not mfile:
+            log.verb("使用内嵌最小映射表 (未找到 data/dep-map.conf)")
+        self.repo = arch_repo_names()
+        self.unresolved = []
+        self.droplog = []
+        self.translated = []
+
+    # ---- 规则链 ----
+    def _lookup(self, name: str) -> Optional[str]:
+        # 1. 显式映射
+        if name in self.plain:
+            return self.plain[name] or None    # 空值 = 丢弃
+        if name in self.drops:
+            return None
+        # 2. 正则
+        for rx, dest in self.regexes:
+            if rx.match(name):
+                return dest or None
+        # 3. 直接与 Arch 仓库同名
+        if name in self.repo:
+            return name
+        # 4. lib 前缀/soname 后缀变形
+        cands = []
+        m = re.match(r"^(lib[^-]+?)[0-9]+([.][0-9.]+)?([-+].*)?$", name)
+        if m:
+            base = m.group(1)
+            cands += [base]
+        m2 = re.match(r"^(lib)?(.+?)(-dev|-devel|-doc|-docs|-common|-bin)?$", name)
+        if m2:
+            core = m2.group(2)
+            if m2.group(3) == "-dev" or m2.group(3) == "-devel":
+                cands += [core, m2.group(1) + core if m2.group(1) else core]
+            else:
+                cands += [core]
+        # soname: libfoo.so.5
+        m3 = re.match(r"^(lib[^.]+)\.so(\.[0-9.]+)?$", name)
+        if m3:
+            lib = m3.group(1)
+            cands = [lib, lib[3:] if lib.startswith("lib") else lib] + cands
+        for c in cands:
+            if not c or len(c) <= 2:
+                continue
+            if c in self.plain:
+                return self.plain[c] or None
+            if c in self.repo:
+                return c
+            # 再试 去 lib
+            if c.startswith("lib") and len(c) > 5:
+                c2 = c[3:]
+                if c2 in self.plain:
+                    return self.plain[c2] or None
+                if c2 in self.repo:
+                    return c2
+        return None
+
+    def translate(self, dep: Dep, ctx: str) -> Dep:
+        """翻译单条依赖; 无法翻译时按 --keep-unknown-deps 决定去留"""
+        name = dep.name
+        if name in self.drops:
+            self.droplog.append(name)
+            return None
+        if ctx == "deb" and name in DEB_TRASH:
+            self.droplog.append(name)
+            return None
+        newname = self._lookup(name)
+        if newname:
+            nd = Dep(newname, dep.op, dep.ver)
+            if newname != name:
+                self.translated.append(f"{name}->{newname}")
+            else:
+                self.translated.append(f"{name}(同名直用)")
+            return nd
+        # 去留由 opts.keep_unknown_deps 决定, 记录里只保留原始依赖名,
+        # 避免输出与报告出现 "(保留原样)" 之类的重复注解
+        self.unresolved.append(name)
+        return dep if self.opts.keep_unknown_deps else None
+
+    def reset(self):
+        self.unresolved = []
+        self.droplog = []
+        self.translated = []
+
+
+# 各源依赖的"垃圾名单"
+RPM_GARBAGE = [
+    re.compile(r"^rpmlib\(.*"), re.compile(r"^rtld\([^)]*\)$"),
+    re.compile(r"^config\([^)]*\)$"), re.compile(r"^/.*"),           # /bin/sh 等
+    re.compile(r".*\.so(\.[0-9]+)*(\([^)]*\))*$"),       # soname 含 GLIBC 版本标记/64bit
+    re.compile(r"^objfmt\("), re.compile(r"^elf\("),
+    re.compile(r"^python\(abi\)"), re.compile(r"^perl\("), re.compile(r"^ruby\("),
+    re.compile(r"^bundled\("), re.compile(r"^debuginfod\("),
+    re.compile(r"^[A-Za-z0-9._+-]+\((x86-64|x86|aarch64|i686|ppc64le|s390x|riscv64)\)$"),  # 架构虚拟 provides
+]
+
+DEB_TRASH = {  # 这些是发行版基础设施包, Arch 无对应概念, deb 特有丢弃集
+    "debconf", "debconf-2.0", "dpkg", "install-info", "libc-bin", "init-system-helpers",
+    "base-files", "adduser", "usr-is-merged", "coreutils", "bash", "dash", "mount",
+    "passwd", "passwd:", "libsasl2-modules", "systemd-sysv", "sysvinit-utils",
+    "lsb-base", "libgcc-12-base", "libgcc-s1", "gcc-12-base", "gcc-13-base",
+    "ucf", "mime-support", "media-types", "x11-common", "shared-mime-info",
+}
+
+APK_TRASH_RE = [
+    re.compile(r"^so:.*"), re.compile(r"^cmd:.*"),
+]
+
+# ---------------------------------------------------------------------------
+# 各格式 handler: 返回 (Metadata, tree_dir, workdir)
+# ---------------------------------------------------------------------------
+
+def pkg_deb(path: str, opts) -> Tuple[Metadata, str, str]:
+    members = parse_ar(path)
+    ctrl_name = next((n for n, _ in members if n.startswith("control.tar.")), None)
+    data_name = next((n for n, _ in members if n.startswith("data.tar.")), None)
+    if not ctrl_name or not data_name:
+        die(f"deb 内缺少 control/data 成员: {path}")
+
+    work = tempfile.mkdtemp(prefix="alltap-deb-")
+    ctrl_arch = os.path.join(work, "control.tar")
+    data_arch = os.path.join(work, "data.tar")
+    open(ctrl_arch, "wb").write(dict(members)[ctrl_name])
+    open(data_arch, "wb").write(dict(members)[data_name])
+
+    cdir = os.path.join(work, "control")
+    fdir = os.path.join(work, "files")
+    bsdtar_extract(ctrl_arch, cdir)
+    bsdtar_extract(data_arch, fdir)
+
+    ctrl_files = []
+    for root, _, files in os.walk(cdir):
+        for fn in files:
+            ctrl_files.append(os.path.relpath(os.path.join(root, fn), cdir))
+    ctrl_path = next((c for c in ctrl_files if c.endswith("control")), None)
+    if not ctrl_path:
+        die("deb control 成员中没有 control 文件")
+    fields = parse_deb_control(open(os.path.join(cdir, ctrl_path), encoding="utf8", errors="replace").read())
+
+    meta = Metadata(source_fmt="deb")
+    meta.name = sanitize_pkgname(fields.get("Package", "pkg"))
+    epoch, ver, rel = split_deb_version(fields.get("Version", "1.0-1"))
+    meta.epoch, meta.version, meta.release = epoch, sanitize_ver(ver), sanitize_rel(rel)
+    desc_lines = fields.get("Description", "").splitlines()
+    meta.desc = (desc_lines[0] if desc_lines else "(无描述)").strip() or "(无描述)"
+    meta.long_desc = "\n".join(l for l in desc_lines[1:] if l.strip() != ".").strip()
+    meta.arch = map_arch(fields.get("Architecture", ""), "deb")
+    meta.url = fields.get("Homepage", "").strip()
+    meta.license = "unknown"
+
+    tr = opts.translator  # type: Translator
+
+    # Depends / Pre-Depends → depends
+    for key in ("Depends", "Pre-Depends"):
+        groups = parse_deb_dep_string(fields.get(key, ""))
+        for alts in groups:
+            chosen = None
+            for a in alts:                # alternative 取第一个能翻译成功的
+                nd = tr.translate(a, "deb")
+                if nd:
+                    chosen = nd
+                    break
+            if chosen:
+                meta.depends.append(chosen)
+            elif opts.keep_unknown_deps and alts:
+                meta.depends.append(alts[0])
+
+    # Recommends → optdepends
+    for alts in parse_deb_dep_string(fields.get("Recommends", "")):
+        if not alts:
+            continue
+        d = alts[0]
+        meta.optdepends.append(f"{d.name}: (由 Recommends 转换, 可选)")
+
+    # Provides / Conflicts / Breaks / Replaces (未识别的保留原名, 不计入依赖报告)
+    for alts in parse_deb_dep_string(fields.get("Provides", "")):
+        d = alts[0]
+        nm = tr._lookup(d.name) or d.name
+        meta.provides.append(d.to_pacman() if d.op else nm)
+    for alts in (parse_deb_dep_string(fields.get("Conflicts", "")) +
+                 parse_deb_dep_string(fields.get("Breaks", ""))):
+        d = alts[0]
+        nm = tr._lookup(d.name) or d.name
+        meta.conflicts.append(Dep(nm, d.op, d.ver).to_pacman() if d.op else nm)
+    for alts in parse_deb_dep_string(fields.get("Replaces", "")):
+        d = alts[0]
+        meta.replaces.append(d.name)
+
+    # 维护脚本 → .INSTALL (deb 参数语义模拟)
+    script_map = {
+        "preinst":  [("pre_install", "install"), ("pre_upgrade", "upgrade")],
+        "postinst": [("post_install", "configure"), ("post_upgrade", "configure")],
+        "prerm":    [("pre_remove", "remove")],
+        "postrm":   [("post_remove", "remove")],
+    }
+    if not opts.no_scripts:
+        for sname, targets in script_map.items():
+            spath = find_script(cdir, sname)
+            if not spath:
+                continue
+            body = read_script(spath)
+            if body is None:
+                continue
+            for fname, arg in targets:
+                meta.scripts[fname] = f"set -- {arg}\n{body}"
+    return meta, fdir, work
+
+
+MAP_ARCH = {
+    # deb
+    "amd64": "x86_64", "i386": "i686", "i486": "i686", "i586": "i686", "i686": "i686",
+    "arm64": "aarch64", "aarch64": "aarch64", "armhf": "armv7h", "armel": "arm",
+    "riscv64": "riscv64", "loong64": "loongarch64", "ppc64el": "ppc64le", "s390x": "s390x",
+    "mips64el": "mips64el", "all": "any", "any": "any", "linux-any": "any", "noarch": "any",
+    # alpine
+    "x86": "i686", "armv7": "armv7h", "armhf_musl": "armv7h",
+    # slack
+    "ia64": "i686",
+}
+
+
+def map_arch(a: str, src: str) -> str:
+    a = a.strip().lower()
+    if not a:
+        return "any"
+    return MAP_ARCH.get(a, a if a in ("x86_64", "i686", "aarch64", "any", "armv7h", "riscv64", "arm", "loongarch64") else "x86_64")
+
+
+def split_deb_version(v: str):
+    v = v.strip()
+    epoch = ""
+    m = re.match(r"^(\d+):(.*)$", v)
+    if m:
+        epoch, v = m.group(1), m.group(2)
+    if "-" in v:
+        ver, rel = v.rsplit("-", 1)
+    else:
+        ver, rel = v, "1"
+    ver = re.sub(r"[~]", "_", ver)
+    rel = re.sub(r"[~+]", "_", rel)
+    return epoch, ver, rel
+
+
+DEB_OP = {"<<": "<", "<=": "<=", "=": "=", ">=": ">=", ">>": ">", ">": ">", "<": "<"}
+
+
+def parse_deb_dep_string(s: str):
+    """返回 [[Dep, Dep...](alternatives), ...]"""
+    out = []
+    if not s:
+        return out
+    for grp in s.split(","):
+        grp = grp.strip()
+        if not grp:
+            continue
+        alts = []
+        for item in grp.split("|"):
+            item = item.strip()
+            if not item:
+                continue
+            m = re.match(r"^([A-Za-z0-9][^()\[\s:]*)(?::(any|native))?\s*(\(\s*(<<|<=|=|>=|>>)\s*([^)]+)\s*\))?", item)
+            if not m:
+                continue
+            name = m.group(1)
+            op = ver = None
+            if m.group(4):
+                op, ver = DEB_OP.get(m.group(4), m.group(4)), m.group(5).strip()
+            alts.append(Dep(name, op, ver))
+        if alts:
+            out.append(alts)
+    return out
+
+
+def find_script(d: str, sname: str):
+    for root, _, files in os.walk(d):
+        for fn in files:
+            rel = os.path.relpath(os.path.join(root, fn), d)
+            if rel == sname or rel.endswith("/" + sname) or rel == "./" + sname:
+                return os.path.join(root, fn)
+    return None
+
+
+def read_script(path: str, strip_shebang=True):
+    try:
+        txt = open(path, encoding="utf8", errors="replace").read()
+    except OSError:
+        return None
+    lines = txt.splitlines()
+    if strip_shebang and lines and lines[0].startswith("#!"):
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def rpm_dep_triplet(rpm: RpmInfo, ntag, ftag, vtag):
+    names = rpm.f.get(T[ntag], []) or []
+    flags = rpm.f.get(T[ftag], []) or []
+    vers = rpm.f.get(T[vtag], []) or []
+    out = []
+    for i, nm in enumerate(names):
+        fl = flags[i] if i < len(flags) else 0
+        vv = vers[i] if i < len(vers) else ""
+        out.append((nm, fl, vv))
+    return out
+
+
+def pkg_rpm(path: str, opts) -> Tuple[Metadata, str, str]:
+    try:
+        rpm = parse_rpm(path)
+    except ValueError as e:
+        raise ValueError(f"RPM 解析失败: {e}")
+
+    work = tempfile.mkdtemp(prefix="alltap-rpm-")
+    fdir = os.path.join(work, "files")
+    n = rpm.payload_to(fdir)
+    log.verb(f"RPM payload ({rpm.compressor}) 解出 {n} 条目")
+
+    meta = Metadata(source_fmt="rpm")
+    name = rpm.f.get(T["NAME"], "pkg")
+    meta.name = sanitize_pkgname(name)
+    rel = rpm.f.get(T["RELEASE"], "1")
+    vr = rpm.f.get(T["VERSION"], "1.0")
+    ep = rpm.f.get(T["EPOCH"], None)
+    if isinstance(ep, list):
+        ep = str(ep[0]) if ep else ""
+    meta.epoch = ep or ""
+    mrel = re.match(r"^(\d+)", rel)
+    meta.version = sanitize_ver(vr)
+    meta.release = mrel.group(1) if mrel else sanitize_rel(rel)
+    summary = rpm.f.get(T["SUMMARY"], []) or "(无描述)"
+    if isinstance(summary, list):
+        summary = summary[0] if summary else ""
+    meta.desc = summary.strip() or "(无描述)"
+    desc = rpm.f.get(T["DESCRIPTION"], "") or ""
+    meta.long_desc = desc.strip() if isinstance(desc, str) else desc[0] if desc else ""
+    meta.arch = map_arch(rpm.f.get(T["ARCH"], "x86_64"), "rpm")
+    meta.url = rpm.f.get(T["URL"], "") or ""
+    lic_raw = rpm.f.get(T["LICENSE"], "") or "unknown"
+    parts = [p.strip() for p in re.split(r"\s+(?:AND|OR|and|or)\s+", lic_raw) if p.strip() and p.strip() not in ("(", ")", "AND", "OR")]
+    lic_out = []
+    for p in parts:
+        v = sanitize_license(p)
+        if v and v not in lic_out:
+            lic_out.append(v)
+    meta.license = " ".join(lic_out) or "unknown"
+
+    tr = opts.translator
+
+    # Requires
+    for nm, fl, vv in rpm_dep_triplet(rpm, "REQUIRENAME", "REQUIREFLAGS", "REQUIREVERSION"):
+        if is_rpm_virtual(nm):
+            log.verb(f"丢弃 RPM 虚拟/soname 依赖: {nm}")
+            tr.droplog.append(nm)
+            continue
+        d = Dep(nm, rpm_sense_to_op(fl), vv.strip() or None)
+        nd = tr.translate(d, "rpm")
+        if nd:
+            meta.depends.append(nd)
+
+    # Recommends (weak) → optdepends
+    for nm, fl, vv in rpm_dep_triplet(rpm, "RECOMMENDNAME", "RECOMMENDFLAGS", "RECOMMENDVERSION"):
+        if not is_rpm_virtual(nm):
+            meta.optdepends.append(f"{nm}: (由 Recommends 转换, 可选)")
+
+    # Provides (未识别保留原名, 不计入依赖报告)
+    for nm, fl, vv in rpm_dep_triplet(rpm, "PROVIDENAME", "PROVIDEFLAGS", "PROVIDEVERSION"):
+        if is_rpm_virtual(nm):
+            continue
+        op = rpm_sense_to_op(fl)
+        meta.provides.append(Dep(nm, op, vv).to_pacman() if op and vv else nm)
+
+    # Conflicts / Obsoletes
+    for nm, fl, vv in rpm_dep_triplet(rpm, "CONFLICTNAME", "CONFLICTFLAGS", "CONFLICTVERSION"):
+        if is_rpm_virtual(nm):
+            continue
+        meta.conflicts.append(Dep(nm, rpm_sense_to_op(fl), vv).to_pacman())
+    for nm, fl, vv in rpm_dep_triplet(rpm, "OBSOLETENAME", "OBSOLETEFLAGS", "OBSOLETEVERSION"):
+        if is_rpm_virtual(nm):
+            continue
+        meta.replaces.append(nm)
+
+    # scriptlets
+    if not opts.no_scripts:
+        prog = rpm.f.get(T["POSTINPROG"], "")
+        ldconfig = False
+        if isinstance(prog, list):
+            ldconfig = any(p.endswith("ldconfig") for p in prog if p)
+        postin = rpm.f.get(T["POSTIN"], "") or ""
+        postin = postin[0] if isinstance(postin, list) and postin else postin
+        prein = rpm.f.get(T["PREIN"], "") or ""
+        prein = prein[0] if isinstance(prein, list) and prein else prein
+        preun = rpm.f.get(T["PREUN"], "") or ""
+        preun = preun[0] if isinstance(preun, list) and preun else preun
+        postun = rpm.f.get(T["POSTUN"], "") or ""
+        postun = postun[0] if isinstance(postun, list) and postun else postun
+        if postin.strip():
+            meta.scripts["post_install"] = f"set -- 1\n{postin.strip()}"
+            meta.scripts["post_upgrade"] = f"set -- 2\n{postin.strip()}"
+            if ldconfig:
+                for k in ("post_install", "post_upgrade"):
+                    meta.scripts[k] += "\nldconfig"
+        elif ldconfig:
+            meta.scripts["post_install"] = "ldconfig"
+            meta.scripts["post_upgrade"] = "ldconfig"
+        if prein.strip():
+            meta.scripts["pre_install"] = f"set -- 1\n{prein.strip()}"
+            meta.scripts["pre_upgrade"] = f"set -- 2\n{prein.strip()}"
+        if preun.strip():
+            meta.scripts["pre_remove"] = f"set -- 0\n{preun.strip()}"
+        if postun.strip():
+            meta.scripts["post_remove"] = f"set -- 0\n{postun.strip()}"
+        pretr = rpm.f.get(T["PRETRANS"], "")
+        posttr = rpm.f.get(T["POSTTRANS"], "")
+        if (pretr and pretr.strip()) or (posttr and posttr.strip()):
+            log.warn("RPM 的 pre/posttrans 脚本在 pacman 中无直接对应, 已忽略")
+    return meta, fdir, work
+
+
+def is_rpm_virtual(nm: str) -> bool:
+    for rx in RPM_GARBAGE:
+        if rx.match(nm):
+            return True
+    return False
+
+
+def sanitize_license(l: str) -> str:
+    l = l.strip()
+    if not l:
+        return "unknown"
+    # 常见别名归并
+    aliases = {
+        # 传统写法
+        "GPLv2": "GPL2", "GPLv2+": "GPL", "GPLv3": "GPL3", "GPLv3+": "GPL",
+        "GPL": "GPL", "LGPLv2": "LGPL", "LGPLv2+": "LGPL",
+        "LGPLv3": "LGPL", "MIT": "MIT", "BSD": "BSD", "BSD-2-Clause": "BSD",
+        "BSD-3-Clause": "BSD", "ASL 2.0": "Apache", "Apache-2.0": "Apache",
+        "ISC": "ISC", "MPLv1.1": "MPL", "MPLv2.0": "MPL", "Python": "Python",
+        "Public Domain": "public-domain", "unknown": "unknown",
+        # SPDX 写法 (新 rpm/Fedora 默认)
+        "GPL-2.0-only": "GPL2", "GPL-2.0-or-later": "GPL",
+        "GPL-2.0-or-newer": "GPL", "GPL-2+": "GPL",
+        "GPL-3.0-only": "GPL3", "GPL-3.0-or-later": "GPL",
+        "GPL-3.0-or-newer": "GPL", "GPL-3+": "GPL",
+        "LGPL-2.0-only": "LGPL", "LGPL-2.0-or-later": "LGPL",
+        "LGPL-2.1-only": "LGPL", "LGPL-2.1-or-later": "LGPL",
+        "LGPL-3.0-only": "LGPL", "LGPL-3.0-or-later": "LGPL",
+        "LGPL-2.1+": "LGPL", "LGPL-3+": "LGPL",
+        "BSD-2-Clause-FreeBSD": "BSD", "Apache-2.0": "Apache",
+        "MPL-1.1": "MPL", "MPL-2.0": "MPL", "PSF-2.0": "Python",
+        "Zlib": "ZLIB", "BSL-1.0": "Boost", "CDDL-1.0": "CDDL",
+        "Artistic-1.0-Perl": "PerlArtistic", "Artistic-2.0": "Artistic2.0",
+    }
+    v = aliases.get(l)
+    if v:
+        return v
+    return "custom" if len(l) > 24 else re.sub(r"[^A-Za-z0-9.+-]", "", l) or "custom"
+
+# ---- Alpine apk ------------------------------------------------------------
+
+def parse_pkginfo_kv(text: str):
+    kv = {}
+    last = None
+    for line in text.splitlines():
+        m = re.match(r"^(\w[\w-]*)\s*=\s*(.*)$", line)
+        if m:
+            last = m.group(1)
+            kv[last] = m.group(2).strip()
+        elif line.startswith(" ") and last:
+            kv[last] += "\n" + line.strip()
+    return kv
+
+
+def pkg_apk(path: str, opts) -> Tuple[Metadata, str, str]:
+    work = tempfile.mkdtemp(prefix="alltap-apk-")
+    fdir = os.path.join(work, "files")
+    meta_files = bsdtar_list(path)
+    bsdtar_extract(path, fdir)
+
+    # 读 .PKGINFO
+    kv = {}
+    pinfo = os.path.join(fdir, ".PKGINFO")
+    if os.path.exists(pinfo):
+        kv = parse_pkginfo_kv(open(pinfo, encoding="utf8", errors="replace").read())
+
+    meta = Metadata(source_fmt="apk")
+    meta.name = sanitize_pkgname(kv.get("pkgname", os.path.basename(path).split(".apk")[0]))
+    ep, ver, rel = split_apk_version(kv.get("pkgver", "1.0-r0"))
+    meta.epoch, meta.version, meta.release = ep, sanitize_ver(ver), rel
+    desc = kv.get("pkgdesc", "") or ""
+    meta.desc = desc.splitlines()[0].strip() or "(无描述)"
+    meta.long_desc = "\n".join(desc.splitlines()[1:]).strip()
+    meta.arch = map_arch(kv.get("arch", ""), "apk")
+    meta.url = kv.get("url", "")
+    meta.license = sanitize_license(kv.get("license", "unknown"))
+
+    tr = opts.translator
+    for dn in (kv.get("depends", "") or "").split():
+        if any(rx.match(dn) for rx in APK_TRASH_RE):
+            tr.droplog.append(dn)
+            continue
+        m = re.match(r"^(.*?)([<>=~]+)(.*)$", dn)
+        name, op, ver = dn, None, None
+        if m:
+            name, op, ver = m.group(1), m.group(2).replace("~", ""), m.group(3)
+            op = "=" if op in ("=", "~") else (">=" if op == ">=" else ("<=" if op == "<=" else (">" if op == ">" else ("<" if op == "<" else None))))
+        d = Dep(name, op, ver)
+        nd = tr.translate(d, "apk")
+        if nd:
+            meta.depends.append(nd)
+
+    for pn in (kv.get("provides", "") or "").split():
+        if any(rx.match(pn) for rx in APK_TRASH_RE) or "=" in pn:
+            continue
+        meta.provides.append(pn.replace("!", ""))
+    for rn in (kv.get("replaces", "") or "").split():
+        meta.replaces.append(rn)
+
+    # alpine 安装脚本 → pacman 语义一一对应 (最好移植的场景)
+    if not opts.no_scripts:
+        pairs = {".pre-install": None, ".post-install": None, ".pre-upgrade": None,
+                 ".post-upgrade": None, ".pre-deinstall": None, ".post-deinstall": None}
+        for fname in pairs:
+            sp = os.path.join(fdir, fname)
+            if os.path.exists(sp):
+                pairs[fname] = read_script(sp)
+        mapping = {".pre-install": "pre_install", ".post-install": "post_install",
+                   ".pre-upgrade": "pre_upgrade", ".post-upgrade": "post_upgrade",
+                   ".pre-deinstall": "pre_remove", ".post-deinstall": "post_remove"}
+        for src, body in pairs.items():
+            if body:
+                meta.scripts[mapping[src]] = body
+
+    # 从文件树剔除 meta 文件
+    for junk in (".PKGINFO", ".PKGINFO.new", ".SIGN.RSA.alpine-devel@lists.alpinelinux.org-4a6a0840.rsa.pub",
+                 ".trigger", ".apk-new", ".pre-install", ".post-install", ".pre-upgrade",
+                 ".post-upgrade", ".pre-deinstall", ".post-deinstall",
+                 ".autodeps"):
+        p = os.path.join(fdir, junk)
+        if os.path.exists(p):
+            os.remove(p)
+    for junkdir in (".SIGN",):
+        p = os.path.join(fdir, junkdir)
+        if os.path.isdir(p):
+            shutil.rmtree(p)
+    # 通配 .SIGN.*
+    for name in list(os.listdir(fdir)):
+        if name.startswith(".SIGN."):
+            p = os.path.join(fdir, name)
+            shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+    return meta, fdir, work
+
+
+def split_apk_version(v: str):
+    v = v.strip()
+    epoch = ""
+    m = re.match(r"^(\d+):(.*)$", v)
+    if m:
+        epoch, v = m.group(1), m.group(2)
+    m = re.match(r"^(.*)-r(\d+)$", v)
+    if m:
+        return epoch, m.group(1), m.group(2)
+    return epoch, v, "0"
+# ---- Slackware ---------------------------------------------------------------
+
+def pkg_slack(path: str, opts) -> Tuple[Metadata, str, str]:
+    base = os.path.basename(path)
+    m = re.match(r"^(.+)-([^-]+)-([^-]+)-(\d+)(?:\.txz|\.tgz|\.tar\.xz|\.tar\.gz)$", base, re.I)
+    if not m:
+        die(f"Slackware 包文件名不合规范: {base} (应为 name-version-arch-build.txz)")
+    name, ver, arch, build = m.groups()
+
+    work = tempfile.mkdtemp(prefix="alltap-slk-")
+    fdir = os.path.join(work, "files")
+    bsdtar_extract(path, fdir)
+
+    meta = Metadata(source_fmt="slack")
+    meta.name = sanitize_pkgname(name)
+    meta.version = sanitize_ver(ver)
+    meta.release = build
+    meta.arch = map_arch(arch, "slack")
+
+    # slack-desc
+    sdesc = os.path.join(fdir, "install", "slack-desc")
+    if os.path.exists(sdesc):
+        brief, longd = "", []
+        for line in open(sdesc, encoding="utf8", errors="replace").read().splitlines():
+            if line.startswith("|") or not line.strip():
+                continue
+            if ":" in line:
+                txt = line.split(":", 1)[1].strip()
+                if not brief:
+                    brief = txt
+                elif txt:
+                    longd.append(txt)
+        meta.desc = brief or "(Slackware 包, 无描述)"
+        meta.long_desc = "\n".join(longd)
+    else:
+        meta.desc = f"(Slackware 包 {name})"
+
+    # install/ 目录剔除
+    idir = os.path.join(fdir, "install")
+    if os.path.isdir(idir):
+        # doinst.sh 仅记录说明
+        doinst = os.path.join(idir, "doinst.sh")
+        if os.path.exists(doinst) and not opts.no_scripts:
+            body = read_script(doinst)
+            if body:
+                meta.scripts["post_install"] = body
+                meta.scripts["post_upgrade"] = body
+        shutil.rmtree(idir)
+    return meta, fdir, work
+
+
+# ---- AppImage ----------------------------------------------------------------
+
+def pkg_appimage(path: str, opts) -> Tuple[Metadata, str, str]:
+    base = os.path.basename(path)
+    raw = base[:-len(".AppImage")] if base.lower().endswith(".appimage") else base
+    mver = re.match(r"^(.*?)-v?([0-9][0-9A-Za-z.+-]*)$", raw)
+    if mver:
+        raw, raw_ver = mver.group(1), mver.group(2)
+    else:
+        raw, raw_ver = raw, "1.0"
+    name = sanitize_pkgname(opts.name or raw)
+    ver = opts.version or raw_ver
+
+    work = tempfile.mkdtemp(prefix="alltap-appi-")
+    fdir = os.path.join(work, "files")
+    prefix = opts.prefix.format(pkgname=name) if "{pkgname}" in opts.prefix else (opts.prefix.rstrip("/") + "/" + name)
+    appdir = os.path.join(fdir, prefix.lstrip("/"))
+    os.makedirs(appdir, exist_ok=True)
+    shutil.copy2(path, os.path.join(appdir, f"{name}.AppImage"))
+    os.chmod(os.path.join(appdir, f"{name}.AppImage"), 0o755)
+    bindir = os.path.join(fdir, "usr", "bin")
+    os.makedirs(bindir, exist_ok=True)
+    os.symlink(f"{prefix}/{name}.AppImage", os.path.join(bindir, name))
+
+    # 从 ELF 判架构
+    arch = "x86_64"
+    try:
+        with open(path, "rb") as f:
+            h = f.read(20)
+            if h[:4] == b"\x7fELF":
+                fm = h[4]
+                bit = {1: 32, 2: 64}.get(fm, 64)
+                mach = struct.unpack("<H", h[18:20])[0]
+                if bit == 64 and mach == 0x3e:
+                    arch = "x86_64"
+                elif bit == 64 and mach == 0xb7:
+                    arch = "aarch64"
+                elif bit == 32 and mach == 0x03:
+                    arch = "i686"
+                elif bit == 64 and mach == 0xf3:
+                    arch = "riscv64"
+    except OSError:
+        pass
+
+    meta = Metadata(source_fmt="appimage")
+    meta.name = name
+    e, v, r = split_deb_version(ver)
+    meta.epoch, meta.version, meta.release = e, sanitize_ver(v), sanitize_rel(r)
+    meta.desc = opts.desc or f"AppImage 重打包: {raw}"
+    meta.arch = opts.arch or arch
+    meta.license = "unknown"
+    return meta, fdir, work
+
+# ---- 通用归档 ----------------------------------------------------------------
+
+def pkg_tarball(path: str, opts) -> Tuple[Metadata, str, str]:
+    names = bsdtar_list(path)
+    tops = sorted({n.split("/")[0] for n in names if "/" in n and n.split("/")[0] not in (".", "..")})
+    single_top = tops[0] if len(tops) == 1 else None
+    sys_dirs = {"usr", "etc", "lib", "lib32", "lib64", "bin", "sbin", "opt", "var"}
+    prefix = (single_top + "/") if single_top else ""
+
+    def rel(n):
+        return n[len(prefix):] if prefix and n.startswith(prefix) else n
+
+    # 系统树判定: 允许归档带一层顶层目录 (如 myapp-9/usr/...)
+    has_system = any(rel(n).split("/")[0] in sys_dirs for n in names if "/" in n)
+    has_system = has_system or any(rel(n) in sys_dirs for n in names)
+
+    work = tempfile.mkdtemp(prefix="alltap-tb-")
+    fdir = os.path.join(work, "files")
+    bsdtar_extract(path, fdir)
+
+    meta = Metadata(source_fmt="tarball")
+    guess_name, guess_ver = "pkg", "1.0"
+    if opts.name:
+        guess_name = opts.name
+        guess_ver = opts.version or "1.0"
+    elif single_top:
+        m = re.match(r"^([A-Za-z0-9._+-]+?)[-_.]?v?(\d[\w.+]*)$", single_top)
+        if m:
+            guess_name, guess_ver = m.group(1), m.group(2)
+        else:
+            guess_name = single_top.lower()
+    else:
+        guess_name = os.path.basename(path).split(".")[0].lower()
+
+    if single_top and has_system:
+        # 系统树 + 单顶层: 剥掉顶层目录
+        sub = os.path.join(fdir, single_top)
+        if os.path.isdir(sub):
+            for item in os.listdir(sub):
+                shutil.move(os.path.join(sub, item), os.path.join(fdir, item))
+            os.rmdir(sub)
+    elif not has_system:
+        # 无系统树 → 统一装到 /opt/<pkgname>
+        pname = sanitize_pkgname(guess_name)
+        pfx = (opts.prefix.format(pkgname=pname) if "{pkgname}" in opts.prefix
+               else (opts.prefix.rstrip("/") + "/" + pname))
+        tgt = os.path.join(fdir, pfx.lstrip("/"))
+        os.makedirs(tgt, exist_ok=True)
+        if single_top:
+            sub = os.path.join(fdir, single_top)
+            for item in os.listdir(sub):
+                shutil.move(os.path.join(sub, item), os.path.join(tgt, item))
+            os.rmdir(sub)
+        else:
+            os.makedirs(os.path.join(fdir, "opt"), exist_ok=True)
+            for item in os.listdir(fdir):
+                if item == "opt":
+                    continue
+                shutil.move(os.path.join(fdir, item), os.path.join(tgt, item))
+
+    meta.name = sanitize_pkgname(guess_name)
+    e, v, r = split_deb_version(guess_ver)
+    meta.epoch, meta.version, meta.release = e, sanitize_ver(v), sanitize_rel(r)
+    meta.desc = opts.desc or f"通用归档重打包: {os.path.basename(path)}"
+    meta.arch = opts.arch or "any"
+    meta.license = "unknown"
+    return meta, fdir, work
+
+# ---- Arch 包重打包 ------------------------------------------------------------
+
+def pkg_archpkg(path: str, opts) -> Tuple[Metadata, str, str]:
+    work = tempfile.mkdtemp(prefix="alltap-pkg-")
+    fdir = os.path.join(work, "files")
+    bsdtar_extract(path, fdir)
+    pinfo = os.path.join(fdir, ".PKGINFO")
+    if not os.path.exists(pinfo):
+        die("这不是有效的 Arch 包 (缺 .PKGINFO)")
+    text = open(pinfo, encoding="utf8", errors="replace").read()
+    kv = parse_pkginfo_kv(text)
+
+    def get_lists(key):
+        return re.findall(rf"^{re.escape(key)}\s*=\s*(.*)$", text, re.M)
+
+    meta = Metadata(source_fmt="archpkg")
+    meta.name = sanitize_pkgname(kv.get("pkgname", "pkg"))
+    if opts.name:
+        meta.name = sanitize_pkgname(opts.name)
+    full = kv.get("pkgver", "1.0-1")
+    if ":" in full:
+        meta.epoch, full = full.split(":", 1)
+    if "-" in full:
+        meta.version, meta.release = full.rsplit("-", 1)
+    else:
+        meta.version, meta.release = full, "1"
+    meta.desc = kv.get("pkgdesc", "(无描述)").splitlines()[0]
+    meta.long_desc = kv.get("pkgdesc", "")
+    meta.arch = map_arch(kv.get("arch", "x86_64"), "")
+    meta.url = kv.get("url", "")
+    meta.license = sanitize_license(kv.get("license", "unknown"))
+    for d in get_lists("depend"):
+        for (nm, op, ver) in [parse_pacman_dep(d)]:
+            if nm:
+                meta.depends.append(Dep(nm, op, ver))
+    for o in get_lists("optdepend"):
+        meta.optdepends.append(o)
+    for p in get_lists("provides"):
+        nm, op, ver = parse_pacman_dep(p)
+        meta.provides.append(p)
+    for c in get_lists("conflict"):
+        meta.conflicts.append(c)
+    for r in get_lists("replaces"):
+        meta.replaces.append(r)
+
+    # .INSTALL 保留
+    inst = os.path.join(fdir, ".INSTALL")
+    if os.path.exists(inst) and not opts.no_scripts:
+        body = open(inst, encoding="utf8", errors="replace").read()
+        for fn in re.findall(r"(?:post_install|pre_install|post_upgrade|pre_upgrade|pre_remove|post_remove)\s*\(\)\s*\{", body):
+            pass  # 简单起见整体保留在 .INSTALL 后续打包时原样写回
+        meta.scripts["__raw__"] = body
+    # remove 元文件 (重打)
+    for j in (".PKGINFO", ".MTREE", ".BUILDINFO", ".INSTALL", ".CHANGELOG", ".CHANGELOGS"):
+        p = os.path.join(fdir, j)
+        if os.path.exists(p):
+            os.remove(p)
+    return meta, fdir, work
+
+
+def parse_pacman_dep(s: str):
+    m = re.match(r"^([^<>=]+?)((<=|>=|=|<|>)(.*))?$", s.strip())
+    if not m:
+        return (s.strip(), None, None)
+    return m.group(1), m.group(3), m.group(4)
+
+# ---------------------------------------------------------------------------
+# 打包: .PKGINFO + .MTREE + .INSTALL → bsdtar → .pkg.tar.zst
+# ---------------------------------------------------------------------------
+
+def write_pkginfo(meta: Metadata, pkgroot: str, tree_size: int):
+    lines = [
+        f"pkgname = {meta.name}",
+        f"pkgbase = {meta.name}",
+        f"pkgver = {meta.fullver}",
+    ]
+    if meta.desc:
+        lines.append("pkgdesc = " + " ".join(meta.desc.split()))
+    if meta.url:
+        lines.append(f"url = {meta.url.replace(' ', '%20')}")
+    lines.append(f"builddate = {int(time.time())}")
+    lines.append(f"packager = alltap <alltap@localhost>")
+    lines.append(f"size = {tree_size}")
+    lines.append(f"arch = {meta.arch}")
+    for lic in meta.license.split():
+        lines.append(f"license = {lic}")
+    for d in meta.depends:
+        lines.append(f"depend = {d.to_pacman()}")
+    for o in meta.optdepends:
+        lines.append(f"optdepend = {o.replace(chr(10), ' ')}")
+    for p in meta.provides:
+        lines.append(f"provides = {p}")
+    for c in meta.conflicts:
+        lines.append(f"conflict = {c}")
+    for r in meta.replaces:
+        lines.append(f"replaces = {r}")
+    for grp in getattr(meta, "groups", []):
+        lines.append(f"group = {grp}")
+    out = os.path.join(pkgroot, ".PKGINFO")
+    with open(out, "w", encoding="utf8") as f:
+        f.write("\n".join(lines) + "\n")
+    return out
+
+
+def write_install(meta: Metadata, pkgroot: str):
+    raw = meta.scripts.get("__raw__")   # 不清除, 支持修复循环中多次打包
+    if raw:
+        body = raw
+    else:
+        wanted = [k for k in ("pre_install", "post_install", "pre_upgrade",
+                              "post_upgrade", "pre_remove", "post_remove") if k in meta.scripts]
+        if not wanted:
+            return None
+        chunks = [f"# 本安装脚本由 alltap 自 {meta.source_fmt} 包维护脚本自动移植, 语义可能有差异, 请酌情检查"]
+        for k in wanted:
+            chunks.append(f"{k}() {{\n{meta.scripts[k]}\n}}\n")
+        body = "\n".join(chunks)
+    out = os.path.join(pkgroot, ".INSTALL")
+    with open(out, "w", encoding="utf8") as f:
+        f.write(body + "\n")
+    return out
+
+
+def tree_size_bytes(d: str) -> int:
+    total = 0
+    for root, _, files in os.walk(d):
+        for fn in files:
+            try:
+                total += os.lstat(os.path.join(root, fn)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def build_pkg_file(meta: Metadata, tree_dir: str, outdir: str, workdir: str) -> str:
+    """构造 .pkg.tar.zst (等价于 makepkg 的产出)"""
+    if not which("bsdtar") or not which("zstd"):
+        die("打包需要 bsdtar 与 zstd: sudo pacman -S libarchive zstd")
+    os.makedirs(outdir, exist_ok=True)
+    pkgroot = os.path.join(workdir, "pkgroot")
+    if os.path.isdir(pkgroot):
+        shutil.rmtree(pkgroot)
+    shutil.copytree(tree_dir, pkgroot, symlinks=True)
+
+    size = tree_size_bytes(pkgroot)
+    write_pkginfo(meta, pkgroot, size)
+    install_file = write_install(meta, pkgroot)
+
+    entries = sorted(e for e in os.listdir(pkgroot)
+                     if e not in (".PKGINFO", ".MTREE", ".INSTALL"))
+    ordered = [".PKGINFO", ".MTREE"] + ([".INSTALL"] if install_file else []) + entries
+    # mtree 列表不含 .MTREE 自身 (尚未生成)
+    mtree_list = [".PKGINFO"] + ([".INSTALL"] if install_file else []) + entries
+
+    # 1) 生成 .MTREE (= makepkg 所做)
+    mtree_cmd = ["bsdtar", "-cf", "-", "--format=mtree",
+                 "--options=!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link",
+                 "--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root"] + mtree_list
+    mtree = subprocess.run(mtree_cmd, cwd=pkgroot, check=True, capture_output=True).stdout
+    with open(os.path.join(pkgroot, ".MTREE"), "wb") as f:
+        f.write(mtree)
+
+    # 2) 打包 zstd
+    outpath = os.path.join(outdir, meta.pkgfilename)
+    tar_cmd = ["bsdtar", "-cf", "-", "--format=gnutar",
+               "--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root"] + ordered
+    p1 = subprocess.Popen(tar_cmd, cwd=pkgroot, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p2 = subprocess.Popen(["zstd", "-q", "-T0", "-o", outpath, "-f"], stdin=p1.stdout,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    p1.stdout.close()
+    _, zerr = p2.communicate()
+    terr = p1.stderr.read().decode("utf8", "replace")
+    p1.wait()
+    if p2.returncode != 0:
+        raise RuntimeError("zstd 压缩失败: " + zerr.decode("utf8", "replace"))
+    if p1.returncode != 0:
+        raise RuntimeError("bsdtar 打包失败: " + terr)
+    return outpath
+
+# ---------------------------------------------------------------------------
+# PKGBUILD 生成 (-p 模式)
+# ---------------------------------------------------------------------------
+
+def pkgbash_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def render_pkgbuild(meta: Metadata, src_file: str, src_format: str, outdir: str) -> str:
+    deps = [pkgbash_quote(d.to_pacman()) for d in meta.depends]
+    optdeps = [pkgbash_quote(o) for o in meta.optdepends]
+    provs = [pkgbash_quote(p) for p in meta.provides]
+    conss = [pkgbash_quote(c) for c in meta.conflicts]
+    repls = [pkgbash_quote(r) for r in meta.replaces]
+
+    lines = []
+    lines.append(f"# 由 alltap {VERSION} 从 {src_format} 包 {src_file} 生成")
+    lines.append(f"# 原包信息: {meta.desc}")
+    lines.append("")
+    lines.append(f"pkgname={pkgbash_quote(meta.name)}")
+    lines.append(f"pkgver={pkgbash_quote((meta.epoch + ':' if meta.epoch else '') + meta.version)}")
+    lines.append(f"pkgrel={pkgbash_quote(meta.release)}")
+    lines.append(f"pkgdesc={pkgbash_quote(meta.desc[:250])}")
+    lines.append(f"arch=({pkgbash_quote(meta.arch)})")
+    lines.append(f"url={pkgbash_quote(meta.url or 'https://example.invalid')}")
+    lines.append(f"license=({pkgbash_quote(meta.license)})")
+    lines.append("depends=(" + " ".join(deps) + ")")
+    if optdeps:
+        lines.append("optdepends=(" + " ".join(optdeps) + ")")
+    if provs:
+        lines.append("provides=(" + " ".join(provs) + ")")
+    if conss:
+        lines.append("conflicts=(" + " ".join(conss) + ")")
+    if repls:
+        lines.append("replaces=(" + " ".join(repls) + ")")
+    lines.append(f"source=({pkgbash_quote(src_file)})")
+    lines.append(f"noextract=({pkgbash_quote(src_file)})")
+    lines.append("md5sums=('SKIP')")
+    lines.append("")
+    lines.append("package() {")
+
+    rel_src = src_file
+    if src_format == "deb":
+        lines.append("  cd \"$srcdir\"")
+        lines.append(f"  ar x \"$srcdir/{rel_src}\"")
+        lines.append("  tar -xf data.tar.* -C \"$pkgdir\"")
+    elif src_format == "rpm":
+        lines.append(f"  (cd \"$pkgdir\"; rpm2cpio \"$srcdir/{rel_src}\" | cpio -idmuv --no-absolute-filenames)")
+        lines.append("  # 需要: rpm2cpio (AUR: rpmextract) 与 cpio")
+    elif src_format == "apk":
+        excl = "--exclude='.PKGINFO' --exclude='.SIGN.*' --exclude='.pre-*' --exclude='.post-*' --exclude='.trigger'"
+        lines.append(f"  bsdtar -xf \"$srcdir/{rel_src}\" -C \"$pkgdir\" {excl}")
+    elif src_format == "slack":
+        lines.append(f"  bsdtar -xf \"$srcdir/{rel_src}\" -C \"$pkgdir\" --exclude='install'")
+    elif src_format == "appimage":
+        lines.append(f"  install -Dm755 \"$srcdir/{rel_src}\" \"$pkgdir/opt/{meta.name}/{meta.name}.AppImage\"")
+        lines.append(f"  ln -s /opt/{meta.name}/{meta.name}.AppImage \"$pkgdir/usr/bin/{meta.name}\"")
+    elif src_format == "tarball":
+        lines.append(f"  bsdtar -xf \"$srcdir/{rel_src}\" -C \"$pkgdir\"")
+    else:
+        lines.append(f"  bsdtar -xf \"$srcdir/{rel_src}\" -C \"$pkgdir\" --exclude='.PKGINFO' --exclude='.MTREE'")
+    lines.append("}")
+    if meta.scripts and "__raw__" not in meta.scripts:
+        lines.append("\n# 安装脚本移植见注释; makepkg 用户请手动合并 install= 脚本")
+    out = os.path.join(outdir, "PKGBUILD")
+    with open(out, "w", encoding="utf8") as f:
+        f.write("\n".join(lines) + "\n")
+    return out
+
+# ---------------------------------------------------------------------------
+# 安装闭环: pacman -U 失败 → 诊断 → 自动修复 → 重试
+# ---------------------------------------------------------------------------
+
+class PacmanRunner:
+    """统一封装 pacman 调用与提权策略 (root 直接; 否则 sudo -n / pkexec)"""
+
+    def __init__(self, opts):
+        self.opts = opts
+        self.bin = os.environ.get("ALLTAP_PACMAN", "pacman")
+        self.root = os.environ.get("ALLTAP_PACMAN_ROOT", "")   # 测试用: 隔离安装根
+        self.no_sudo = os.environ.get("ALLTAP_NO_SUDO") == "1"
+        self._prefix = None
+
+    def prefix(self):
+        if self._prefix is not None:
+            return self._prefix
+        if self.root or self.no_sudo or os.geteuid() == 0:
+            self._prefix = ["env", "LC_ALL=C", self.bin]
+        elif which("sudo") and subprocess.run(["sudo", "-n", "true"],
+                                              capture_output=True).returncode == 0:
+            self._prefix = ["sudo", "-n", "env", "LC_ALL=C", self.bin]
+        elif which("pkexec"):
+            self._prefix = ["pkexec", "env", "LC_ALL=C", self.bin]
+        else:
+            die("安装需要 root: 请以 root 运行 alltap, 或配置免密 sudo(-n) / 安装 pkexec")
+        return self._prefix
+
+    def base(self):
+        args = []
+        if self.root:
+            args += ["--root", self.root,
+                     "--dbpath", os.path.join(self.root, "var", "lib", "pacman")]
+        extra = os.environ.get("ALLTAP_PACMAN_EXTRA", "").split()
+        return args + extra
+
+    def _exec(self, cmd, args, quiet=False):
+        log.verb("$ " + " ".join(cmd + args))
+        env = dict(os.environ)
+        env["LC_ALL"] = "C"
+        env["LANG"] = "C"
+        try:
+            p = subprocess.run(cmd + args, capture_output=True, text=True, env=env, timeout=1800)
+        except subprocess.TimeoutExpired:
+            return 124, "pacman 执行超时"
+        out = (p.stdout or "") + (p.stderr or "")
+        if p.returncode != 0 and not quiet and out.strip():
+            log.info(out.rstrip())
+        return p.returncode, out
+
+    def run(self, args, quiet=False):
+        return self._exec(self.prefix() + self.base(), args, quiet)
+
+    def query(self, args, quiet=False):
+        """非特权查询 (-T / -Si 等): 只读数据库, 不走 sudo/pkexec 提权链
+        避免无 root 时把提权器报错误判为 pacman 输出"""
+        return self._exec(["env", "LC_ALL=C", self.bin] + self.base(), args, quiet)
+
+    def install(self, pkgpaths, overwrite=None):
+        """pacman -U; pkgpaths 可为单路径或多路径 (多包单事务)"""
+        args = ["-U", "--noconfirm"]
+        for f in overwrite or []:
+            args += ["--overwrite", f]
+        args += list(pkgpaths) if isinstance(pkgpaths, (list, tuple)) else [pkgpaths]
+        return self.run(args)
+
+    def sync_asdeps(self, names):
+        return self.run(["-S", "--asdeps", "--noconfirm"] + names)
+
+    def repo_has(self, name):
+        rc, _ = self.query(["-Si", name], quiet=True)
+        return rc == 0
+
+
+PACMAN_CONFLICT = re.compile(r"^(\S+): (\S+) exists in filesystem", re.M)
+PACMAN_REQUIRE_1 = re.compile(r"^(?::: )?([^:\n]+): requires (\S+)", re.M)
+PACMAN_REQUIRE_2 = re.compile(r"unable to satisfy dependency '([^']+)'", re.M)
+PACMAN_REQUIRE_3 = re.compile(r"could not find package (?:'([^']+)'|(\S+))", re.M)
+PACMAN_BREAKS = re.compile(
+    r"installing (\S+) \(([^)]*)\) breaks dependency '([^']+)' required by (\S+)")
+
+
+def parse_pacman_failure(out: str):
+    """解析 pacman 失败输出 (LC_ALL=C) -> dict(kind, deps, files, notes)"""
+    result = {"kind": "other", "deps": [], "files": [], "notes": []}
+
+    files = [m.group(2) for m in PACMAN_CONFLICT.finditer(out)]
+    if files:
+        result["kind"] = "conflict"
+        result["files"] = list(dict.fromkeys(files))
+
+    deps = []
+    for m in PACMAN_REQUIRE_1.finditer(out):
+        deps.append(m.group(2))
+    for m in PACMAN_REQUIRE_2.finditer(out):
+        deps.append(m.group(1))
+    for m in PACMAN_REQUIRE_3.finditer(out):
+        deps.append(m.group(1) or m.group(2))
+    # 过滤误捕获的句子片段
+    deps = [d for d in dict.fromkeys(deps) if d and " " not in d and len(d) < 128]
+    if deps:
+        result["kind"] = "missing"
+        result["deps"] = deps
+
+    breaks = [m.groups() for m in PACMAN_BREAKS.finditer(out)]
+    if breaks:
+        result["notes"] = [f"安装 {a} ({b}) 破坏依赖 {d} (被 {o} 依赖)" for a, b, d, o in breaks]
+        if not deps and not files:
+            result["kind"] = "breaks"
+    return result
+
+
+def dep_base_name(d: str) -> str:
+    return re.split(r"[<>=]", d.strip(), 1)[0].strip()
+
+
+def ask_confirm(opts, question, default=True):
+    """交互确认; -y 自动同意; 非交互环境拒绝需要确认的动作"""
+    if opts.yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    try:
+        ans = input(question + (" [Y/n] " if default else " [y/N] "))
+    except EOFError:
+        return False
+    ans = ans.strip().lower()
+    if not ans:
+        return default
+    return ans in ("y", "yes", "是")
+
+
+def find_dep(meta, base):
+    for d in meta.depends:
+        if d.name == base:
+            return d
+    return None
+
+
+class PKGSpec:
+    """单个待装包的完整上下文: 多包事务与修复循环中的重打包都基于它"""
+
+    def __init__(self, meta, tree_dir, outdir, work, pkgpath, fmt, srcfile):
+        self.meta = meta
+        self.tree_dir = tree_dir    # 包根文件树 (重打包源)
+        self.outdir = outdir
+        self.work = work            # 临时目录, 事务结束后统一清理
+        self.pkgpath = pkgpath
+        self.fmt = fmt
+        self.srcfile = srcfile
+
+    def rebuild(self):
+        """按当前 meta 重新打包 (依赖被移除/改名/放宽后调用)"""
+        self.pkgpath = build_pkg_file(self.meta, self.tree_dir, self.outdir, self.work)
+        return self.pkgpath
+
+
+def specs_with_dep(specs, base):
+    """返回 depends 中含该依赖名的全部 spec"""
+    return [s for s in specs if any(d.name == base for d in s.meta.depends)]
+
+
+def batch_provided_names(specs):
+    """本批包能提供的名字集合: 包名 + provides 基名"""
+    names = set()
+    for s in specs:
+        names.add(s.meta.name)
+        for pv in s.meta.provides:
+            names.add(dep_base_name(pv))
+    return names
+
+
+# ---------------------------------------------------------------------------
+# AUR 依赖兜底: 查询 AUR RPC, 由用户决定是否用 yay/paru 补装
+# ---------------------------------------------------------------------------
+
+AUR_RPC_TPL = "https://aur.archlinux.org/rpc/v5/info?arg[]={name}"
+
+
+def aur_lookup(name: str):
+    """查询 AUR; 返回 ('found'|'absent'|'error', info dict or None)
+    测试通道: ALLTAP_AUR_RPC 覆盖 URL 模板, {name} 会被 URL 编码替换;
+    模板以 file: 开头时直接读本地文件 (便于离线 mock)"""
+    tpl = os.environ.get("ALLTAP_AUR_RPC", AUR_RPC_TPL)
+    quoted = name.replace("/", "_")
+    url = tpl.replace("{name}", quoted)
+    try:
+        if url.startswith("file:"):
+            with open(url[len("file://"):], encoding="utf8") as f:
+                body = f.read()
+        else:
+            if not which("curl"):
+                log.warn("未找到 curl, 无法查询 AUR")
+                return "error", None
+            proc = subprocess.run(["curl", "-fsSL", "-m", "15", url],
+                                  capture_output=True, text=True, timeout=25)
+            if proc.returncode != 0:
+                return "error", None
+            body = proc.stdout
+        data = json.loads(body)
+        for r in data.get("results", []):
+            if r.get("Name") == name:
+                return "found", r
+        return "absent", None
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        log.verb(f"AUR 查询失败 ({name}): {e}")
+        return "error", None
+
+
+def aur_helper_cmd():
+    """AUR 助手命令; 测试通道 ALLTAP_AUR_HELPER 直接指定, 否则找 paru/yay"""
+    env = os.environ.get("ALLTAP_AUR_HELPER")
+    if env:
+        return shlex.split(env)
+    for b in ("paru", "yay"):
+        if which(b):
+            return [b]
+    return None
+
+
+def aur_install(names, opts):
+    """用 AUR 助手补装 (不提权, AUR helper 自行处理); 返回 True/False"""
+    cmdbin = aur_helper_cmd()
+    if not cmdbin:
+        log.warn("未找到 yay/paru, 无法补装 AUR 依赖")
+        return False
+    cmd = cmdbin + ["-S", "--asdeps", "--noconfirm"] + list(names)
+    log.info("$ " + " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, timeout=3600)
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warn(f"AUR 助手执行失败: {e}")
+        return False
+
+
+def aur_summary(info):
+    bits = [f"版本 {info.get('Version', '?')}"]
+    maint = info.get("Maintainer")
+    bits.append(f"维护者 {maint}" if maint else "孤儿包 (无维护者)")
+    if info.get("OutOfDate"):
+        bits.append("已过期 (upstream)")
+    votes = info.get("NumVotes", 0)
+    if votes:
+        bits.append(f"{votes} 票")
+    return ", ".join(bits)
+
+
+def try_aur_packages(bases, opts):
+    """对仓库缺失的依赖查询 AUR; 返回 (可装列表 [(name, info)], 未查询到/失败列表)"""
+    installable, skip = [], []
+    if not opts.aur:
+        return installable, bases
+    for b in bases:
+        st, info = aur_lookup(b)
+        if st == "found":
+            installable.append((b, info))
+        elif st == "absent":
+            log.verb(f"AUR 中不存在 {b}")
+            skip.append(b)
+        else:
+            log.warn(f"无法访问 AUR 查询 {b} (网络不可达?)")
+            skip.append(b)
+    return installable, skip
+
+
+# ---------------------------------------------------------------------------
+# 未知依赖处理: 交互改名/移除 (多包版, 定位依赖归属的包并重打包受影响者)
+# ---------------------------------------------------------------------------
+
+def handle_unknown_deps(specs, names, opts):
+    """仓库/AUR 均无的依赖: 交互选择移除/改名
+    返回 ('rebuild'|'abort', 受影响的 spec 列表)"""
+    log.warn(f"仓库中找不到依赖: {', '.join(names)}")
+    for n in names:
+        owners = ", ".join(s.meta.name for s in specs_with_dep(specs, n)) or "?"
+        log.info(f"    {n} <- 被包 [{owners}] 引用")
+    if opts.yes:
+        affected = []
+        for s in specs:
+            hit = [d for d in s.meta.depends if d.name in names]
+            if hit:
+                s.meta.depends = [d for d in s.meta.depends if d.name not in names]
+                affected.append(s)
+        log.warn("(-y 自动模式) 已移除上述依赖, 重新打包: "
+                 + ", ".join(s.meta.name for s in affected))
+        return "rebuild", affected
+    if not sys.stdin.isatty():
+        log.warn("非交互环境无法询问; 安装中止 (可加 -y 自动移除, 或用 -k 保留原名后手动处理)")
+        return "abort", []
+    print("  可选择:")
+    print("    [1] 从依赖中移除它们 (可能导致运行时缺库)")
+    print("    [2] 改名映射到其它仓库包 / AUR 包后重试")
+    print("    [3] 放弃安装 (包已生成, 可稍后手动处理)")
+    try:
+        choice = input("  选择 [1]: ").strip() or "1"
+    except EOFError:
+        return "abort", []
+    affected = []
+    for s in specs:
+        if any(d.name in names for d in s.meta.depends):
+            affected.append(s)
+    if choice == "1":
+        for s in affected:
+            s.meta.depends = [d for d in s.meta.depends if d.name not in names]
+        return "rebuild", affected
+    if choice == "2":
+        for n in names:
+            try:
+                new = input(f"    依赖 {n} 改为 (留空=移除): ").strip()
+            except EOFError:
+                new = ""
+            for s in affected:
+                d = find_dep(s.meta, n)
+                if d is None:
+                    continue
+                if new:
+                    d.name = sanitize_pkgname(new)
+                else:
+                    s.meta.depends.remove(d)
+        return "rebuild", affected
+    return "abort", []
+
+
+# ---------------------------------------------------------------------------
+# 安装事务: 一次 pacman -U 装全部包, 失败诊断修复后整批重试
+# ---------------------------------------------------------------------------
+
+def install_transaction(specs, opts):
+    """多包安装自愈闭环: 返回 True 表示整批安装成功"""
+    if len(specs) == 1:
+        log.info(f"\n=== 安装: {specs[0].meta.name} ===")
+    else:
+        log.info(f"\n=== 安装事务: {len(specs)} 个包 ===")
+        for s in specs:
+            log.info(f"    {s.meta.name} {s.meta.fullver}  <- {os.path.basename(s.srcfile)}")
+        # 依赖由同批包互相满足的情况, pacman 同一事务会自动解决; 此处仅提示
+        batch_names = batch_provided_names(specs)
+        for s in specs:
+            cross = sorted({d.name for d in s.meta.depends if d.name in batch_names})
+            if cross:
+                log.info(f"    依赖 {', '.join(cross)} 由同批包提供 (同一事务自动满足)")
+
+    runner = PacmanRunner(opts)
+    installed_deps = set()      # 已补装的仓库/AUR 依赖名
+    relaxed_deps = set()        # 已放宽过版本的依赖名 (防死循环)
+    max_tries = max(1, opts.max_tries)
+    overwrite_files = []
+
+    for attempt in range(1, max_tries + 1):
+        pkgnames = " ".join(os.path.basename(s.pkgpath) for s in specs)
+        log.info(f"\n[安装 {attempt}/{max_tries}] pacman -U {pkgnames}")
+        rc, out = runner.install([s.pkgpath for s in specs], overwrite=overwrite_files)
+        if rc == 0:
+            log.info("✓ 安装成功")
+            return True
+
+        diag = parse_pacman_failure(out)
+
+        # ---------- 文件冲突 ----------
+        if diag["kind"] == "conflict" and diag["files"]:
+            files = [f for f in diag["files"] if f not in overwrite_files]
+            if not files:
+                log.warn("文件冲突重复出现, 放弃安装")
+                return False
+            if opts.no_overwrite:
+                log.warn("已禁用文件覆盖 (--no-overwrite), 放弃安装")
+                return False
+            log.info(f"检测到文件冲突 {len(files)} 个:")
+            for f in files[:20]:
+                log.info(f"    {f}")
+            if len(files) > 20:
+                log.info(f"    ... 共 {len(files)} 个")
+            if not ask_confirm(opts, f"用 --overwrite 精确覆盖以上 {len(files)} 个文件?", default=False):
+                return False
+            overwrite_files += files
+            log.info("    已记录冲突文件, 下一轮以 --overwrite 精确覆盖重试")
+            continue
+
+        # ---------- 缺依赖 ----------
+        if diag["kind"] == "missing" and diag["deps"]:
+            for n in diag["notes"]:
+                log.warn(n)
+            bases = []
+            for d in diag["deps"]:
+                b = dep_base_name(d)
+                if b and b not in bases:
+                    bases.append(b)
+            batch_names = batch_provided_names(specs)
+            repo_yes = [b for b in bases if b not in batch_names and runner.repo_has(b)]
+            repo_no = [b for b in bases if b not in batch_names and b not in repo_yes]
+            batch_hit = [b for b in bases if b in batch_names]
+
+            # ① 同批包名也无法满足 -> 版本约束过严, 放宽后重打包
+            if batch_hit:
+                affected = []
+                relax = []
+                for b in batch_hit:
+                    if b in relaxed_deps:
+                        continue
+                    relaxed_deps.add(b)
+                    for s in specs_with_dep(specs, b):
+                        d = find_dep(s.meta, b)
+                        if d and d.op:
+                            relax.append(d)
+                        if s not in affected:
+                            affected.append(s)
+                if relax:
+                    for d in relax:
+                        log.warn(f"依赖 {d.to_pacman()} 与同批包版本不符, 放宽为 {d.name}")
+                        d.op = d.ver = None
+                    for s in affected:
+                        s.rebuild()
+                    log.info("    已重新打包: " + ", ".join(s.meta.name for s in affected))
+                    continue
+                log.warn(f"依赖 {', '.join(batch_hit)} 指向同批包但版本约束仍不满足, 放弃安装")
+                return False
+
+            # ② 仓库有: 补装; 版本约束过严时放宽重打包
+            if repo_yes:
+                relax = []
+                relax_specs = []
+                for b in repo_yes:
+                    if b in relaxed_deps:
+                        continue
+                    for s in specs_with_dep(specs, b):
+                        d = find_dep(s.meta, b)
+                        if d and d.op:
+                            relax.append(d)
+                        if s not in relax_specs:
+                            relax_specs.append(s)
+                # 已补装仍报缺 -> 版本不满足, 放宽重打包
+                need = [b for b in repo_yes if b not in installed_deps]
+                if relax and not need:
+                    for d in relax:
+                        relaxed_deps.add(d.name)
+                        log.warn(f"依赖 {d.to_pacman()} 已补装仍不满足, 放宽为 {d.name}")
+                        d.op = d.ver = None
+                    for s in relax_specs:
+                        s.rebuild()
+                    log.info("    已重新打包: " + ", ".join(s.meta.name for s in relax_specs))
+                    continue
+
+                if need:
+                    if opts.no_autodeps:
+                        log.warn(f"缺失仓库依赖 {need}, 但已禁用自动补装 (--no-autodeps)")
+                        return False
+                    if not ask_confirm(opts, f"从仓库补装缺失依赖 (--asdeps): {', '.join(need)}?"):
+                        return False
+                    rc2, _out2 = runner.sync_asdeps(need)
+                    if rc2 != 0:
+                        log.warn("依赖补装失败, 放弃安装")
+                        return False
+                    installed_deps.update(need)
+                    log.info(f"✓ 已补装依赖: {', '.join(need)}")
+                    continue
+                log.warn("仓库依赖均已尝试补装, 仍无法满足, 放弃安装")
+                return False
+
+            # ③ 仓库无: AUR 兜底 (--aur) -> 询问 yay/paru 补装
+            if repo_no:
+                aur_ok, aur_rest = try_aur_packages(repo_no, opts)
+                if aur_ok:
+                    log.info(f"下列依赖在 AUR 存在:")
+                    for b, info in aur_ok:
+                        log.info(f"    {b}  ({aur_summary(info)})")
+                    if aur_helper_cmd() is None:
+                        log.warn("未安装 yay/paru, 无法自动补装 AUR 依赖 (可: sudo pacman -S yay)")
+                    elif ask_confirm(opts, f"用 AUR 助手补装上述 {len(aur_ok)} 个依赖 (--asdeps)?"
+                                   + (" 将从源码构建, 耗时较长" if not opts.yes else ""),
+                                   default=False):
+                        names = [b for b, _ in aur_ok]
+                        if aur_install(names, opts):
+                            installed_deps.update(names)
+                            log.info(f"✓ 已通过 AUR 补装: {', '.join(names)}")
+                            continue
+                        log.warn("AUR 补装失败, 回退到改名/移除流程")
+                    else:
+                        log.info("已跳过 AUR 补装, 进入改名/移除流程")
+                action, affected = handle_unknown_deps(specs, aur_rest or repo_no, opts)
+                if action == "rebuild":
+                    for s in affected:
+                        s.rebuild()
+                        log.info(f"    已重新打包: {s.meta.name}")
+                    continue
+                return False
+
+        # ---------- 其它失败 ----------
+        for n in diag["notes"]:
+            log.warn(n)
+        log.warn("安装失败且无法自动修复; 成品包保留: "
+                 + ", ".join(s.pkgpath for s in specs))
+        return False
+
+    log.warn(f"达到最大重试次数 ({max_tries}), 安装仍未成功")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# --dry-run 安装计划预演: 依赖求解 + 文件冲突预检, 不执行任何安装
+# ---------------------------------------------------------------------------
+
+def local_db_files():
+    """读 pacman 本地数据库 files 清单 -> {路径: 包名}, 仅文件不含目录
+    读不到 (root 内无数据库) 时返回 None"""
+    root = os.environ.get("ALLTAP_PACMAN_ROOT", "")
+    dbdir = os.path.join(root or "/", "var", "lib", "pacman", "local")
+    if not os.path.isdir(dbdir):
+        return None
+    owned = {}
+    for fdir in _glob.glob(os.path.join(dbdir, "*", "files")):
+        pkg = os.path.basename(os.path.dirname(fdir))
+        try:
+            with open(fdir, encoding="utf8", errors="replace") as f:
+                started = False
+                for line in f:
+                    line = line.rstrip("\n")
+                    if line.startswith("%"):
+                        started = ("FILES" in line)
+                        continue
+                    if not started or not line or line.endswith("/"):
+                        continue
+                    owned.setdefault("/" + line, pkg.rsplit("-", 2)[0] if pkg.count("-") >= 2 else pkg)
+        except OSError:
+            continue
+    return owned or None
+
+
+def dry_run_report(specs, runner, opts):
+    """输出安装计划 (补装哪些依赖 / 覆盖哪些文件 / 哪些需人工决断), 不改动系统"""
+    lines = []
+    emit = lines.append
+    emit("=" * 62)
+    emit(f"alltap 安装计划 (--dry-run, 未实际执行)  {time.strftime('%Y-%m-%d %H:%M')}")
+    emit("=" * 62)
+    emit("")
+    emit(f"待安装包 ({len(specs)} 个):")
+    for s in specs:
+        meta = s.meta
+        emit(f"  • {meta.name} {meta.fullver}  [{meta.arch}]  <- {os.path.basename(s.srcfile)}")
+    batch_names = batch_provided_names(specs)
+
+    # --- 依赖求解: 同批提供 / pacman -T 缺失 / 仓库可补 / 需人工 ---
+    sched_deps = []
+    for s in specs:
+        for d in s.meta.depends:
+            key = d.to_pacman()
+            if key not in sched_deps:
+                sched_deps.append(key)
+    # 剔除同批可满足的 (pacman -U 同一事务自动解决)
+    cross = sorted({dep_base_name(d) for d in sched_deps if dep_base_name(d) in batch_names})
+    check = [d for d in sched_deps if dep_base_name(d) not in batch_names]
+
+    emit("")
+    if cross:
+        emit(f"依赖由同批包互相提供 (同一 pacman -U 事务自动满足): {', '.join(cross)}")
+    if not sched_deps:
+        emit("依赖: 无")
+    elif check:
+        emit("依赖求解 (pacman -T 检查当前系统):")
+        rc, out = runner.query(["-T"] + check, quiet=True) if check else (0, "")
+        missing = [l.strip() for l in out.splitlines() if l.strip()] if rc == 127 else []
+        if rc not in (0, 127):
+            emit(f"  ! 无法执行 pacman -T (返回码 {rc}), 依赖求解跳过")
+            missing = None
+        if missing is not None and rc == 0:
+            emit("  ✓ 全部依赖已满足, 无需补装")
+        elif missing is not None:
+            repo_plan, ask_plan, aur_plan = [], [], []
+            for b in missing:
+                if runner.repo_has(b):
+                    repo_plan.append(b)
+                else:
+                    ask_plan.append(b)
+            if opts.aur and ask_plan:
+                for b in ask_plan:
+                    st, info = aur_lookup(b)
+                    if st == "found":
+                        aur_plan.append((b, info))
+                ask_plan = [b for b in ask_plan if b not in {n for n, _ in aur_plan}]
+            if repo_plan:
+                emit(f"  → 将从仓库补装 (--asdeps): {', '.join(repo_plan)}")
+            for b, info in aur_plan:
+                emit(f"  → AUR 可补装 (需确认): {b}  ({aur_summary(info)})")
+            if ask_plan:
+                emit(f"  ! 仓库无对应依赖, 需人工决断 (改名/移除/AUR): {', '.join(ask_plan)}")
+                emit("    安装时若选择移除, 可能导致运行时缺库")
+
+    # --- 文件冲突预检: 与本地数据库已登记文件比对 ---
+    emit("")
+    owned = local_db_files()
+    conflicts = []
+    if owned is None:
+        emit("文件冲突预检: 跳过 (本地 pacman 数据库不可读或为空)")
+    else:
+        for s in specs:
+            for root_dir, _dirs, files in os.walk(s.tree_dir):
+                for fn in files:
+                    rel = os.path.relpath(os.path.join(root_dir, fn), s.tree_dir)
+                    path = "/" + rel
+                    if path in owned:
+                        conflicts.append((s.meta.name, path, owned[path]))
+        if conflicts:
+            emit(f"文件冲突预检: {len(conflicts)} 个文件已被其它包占用, 安装时将询问 --overwrite:")
+            for pkgname, path, owner in conflicts[:40]:
+                emit(f"  ! {path}  ({pkgname} 与已装 {owner} 冲突)")
+            if len(conflicts) > 40:
+                emit(f"    ... 共 {len(conflicts)} 个")
+        else:
+            emit("文件冲突预检: 与已装包无文件冲突")
+        # 提醒: 不受 pacman 管理的落盘文件无法静态预检
+    emit("  (注: 不属于任何包的散落文件冲突无法静态预检, 以实际安装为准)")
+
+    # --- 脚本提醒 ---
+    scripted = [s.meta.name for s in specs if s.meta.scripts and "__raw__" not in s.meta.scripts]
+    if scripted:
+        emit("")
+        emit(f"⚠ 以下包携带维护脚本, 安装时将以 root 执行: {', '.join(scripted)}")
+
+    plan = "\n".join(lines)
+    print()
+    print(plan)
+    planfile = os.path.join(opts.output, "alltap-plan.txt")
+    try:
+        with open(planfile, "w", encoding="utf8") as f:
+            f.write(plan + "\n")
+        log.info(f"\n✓ 安装计划已写入: {planfile}")
+    except OSError as e:
+        log.warn(f"计划文件写入失败: {e}")
+    log.info("  此为 --dry-run 预演, 未执行任何安装; 确认后可去掉 --dry-run 实际安装")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 每包转换总控
+# ---------------------------------------------------------------------------
+
+HANDLERS = {
+    "deb": pkg_deb, "rpm": pkg_rpm, "apk": pkg_apk, "slack": pkg_slack,
+    "appimage": pkg_appimage, "tarball": pkg_tarball, "archpkg": pkg_archpkg,
+}
+
+
+def convert_one(path: str, opts) -> Optional[str]:
+    log.info(f"\n==> 转换: {os.path.basename(path)}")
+    opts.translator.reset()
+    if not os.path.exists(path):
+        log.warn(f"文件不存在: {path}")
+        return None
+    fmt = detect_format(path)
+    log.info(f"    格式: {fmt}")
+    handler = HANDLERS.get(fmt)
+    if not handler:
+        die(f"内部错误: 无 handler for {fmt}")
+    try:
+        meta, tree_dir, work = handler(path, opts)
+    except ValueError as e:
+        log.warn(f"解析失败: {e}")
+        return None
+
+    # CLI 覆盖
+    if opts.name:
+        meta.name = sanitize_pkgname(opts.name)
+    if opts.desc:
+        meta.desc = opts.desc
+    if opts.url:
+        meta.url = opts.url
+    if opts.arch:
+        meta.arch = map_arch(opts.arch, "")
+    if opts.license:
+        meta.license = opts.license
+    if opts.version:
+        # -v/--pkgver 对全部格式生效, 支持 "1.2" 或 "1.2-3" (后者同时覆盖 pkgrel)
+        e, v, r = split_deb_version(opts.version)
+        meta.epoch, meta.version, meta.release = e, sanitize_ver(v), sanitize_rel(r)
+
+    log.info(f"    包名: {meta.name}  版本: {meta.fullver}  架构: {meta.arch}")
+    log.info(f"    描述: {meta.desc[:120]}")
+
+    tr = opts.translator
+    if tr.translated:
+        log.info(f"    依赖翻译成功 {len(tr.translated)} 条")
+        if log.verbose:
+            for t in tr.translated:
+                log.verb(f"      {t}")
+    if tr.unresolved:
+        verb = "已保留, 交由安装判定" if opts.keep_unknown_deps else "已剔除"
+        print(f"  注意: 未识别依赖({verb}): {', '.join(sorted(set(tr.unresolved)))}")
+
+    outdir = os.path.join(opts.output, meta.name)
+    if os.path.exists(outdir):
+        if opts.force:
+            shutil.rmtree(outdir)
+        else:
+            log.warn(f"输出目录已存在: {outdir}, 跳过 (--force 可覆盖)")
+            return None
+    os.makedirs(outdir, exist_ok=True)
+
+    if opts.pkgbuild:
+        # PKGBUILD 模式: 原包复制到目录里, 附带 .install 脚本
+        shutil.copy2(path, os.path.join(outdir, os.path.basename(path)))
+        if meta.scripts and "__raw__" not in meta.scripts:
+            wanted = [k for k in ("pre_install", "post_install", "pre_upgrade",
+                                  "post_upgrade", "pre_remove", "post_remove") if k in meta.scripts]
+            chunks = [f"# 本安装脚本由 alltap 自 {fmt} 包自动移植, 语义可能有差异"]
+            for k in wanted:
+                chunks.append(f"{k}() {{\n{meta.scripts[k]}\n}}\n")
+            with open(os.path.join(outdir, f"{meta.name}.install"), "w", encoding="utf8") as f:
+                f.write("\n".join(chunks) + "\n")
+        pb = render_pkgbuild(meta, os.path.basename(path), fmt, outdir)
+        if os.path.exists(os.path.join(outdir, f"{meta.name}.install")):
+            with open(pb, encoding="utf8") as f:
+                body = f.read()
+            body = body.replace("noextract=", f"install={meta.name}.install\nnoextract=", 1)
+            with open(pb, "w", encoding="utf8") as f:
+                f.write(body)
+        log.info(f"    ✓ 已生成 PKGBUILD: {pb}")
+        log.info(f"      请在其中目录执行: cd {outdir} && makepkg -sf")
+        return pb
+
+    pkgpath = build_pkg_file(meta, tree_dir, outdir, work)
+    log.info(f"    ✓ 成品包: {pkgpath}")
+    log.info(f"      安装: sudo pacman -U {pkgpath}")
+
+    # 翻译记录 (安装事务模式下同样保留, 便于事后审计)
+    if tr.translated or tr.unresolved:
+        with open(os.path.join(outdir, "alltap-report.txt"), "w", encoding="utf8") as f:
+            f.write(f"source: {os.path.basename(path)}\nformat: {fmt}\n")
+            f.write(f"pkg: {meta.name} {meta.fullver}\n\n[翻译成功的依赖]\n")
+            f.write("\n".join(tr.translated) + "\n\n[未识别的依赖")
+            f.write("(已保留, 交由安装判定)]\n" if opts.keep_unknown_deps else "(已剔除)]\n")
+            f.write("\n".join(tr.unresolved) + "\n")
+
+    # 安装预演 / 安装事务模式: 返回 PKGSpec, work 由主流程统一清理
+    if opts.install or opts.dry_run:
+        return PKGSpec(meta, tree_dir, outdir, work, pkgpath, fmt, path)
+
+    shutil.rmtree(work, ignore_errors=True)
+    return pkgpath
+
+# ---------------------------------------------------------------------------
+# deb control 解析 (RFC822 continuation)
+# ---------------------------------------------------------------------------
+
+def parse_deb_control(text: str):
+    fields = {}
+    cur = None
+    for line in text.splitlines():
+        if not line.strip():
+            cur = None
+            continue
+        if (line.startswith(" ") or line.startswith("\t")) and cur:
+            fields[cur] += "\n" + line.strip()
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            cur = k.strip()
+            fields[cur] = v.strip()
+    return fields
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog=PROG, description="alltap — 把 (几乎) 所有 Linux 软件包转换成 Arch Linux 包",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  alltap package.deb                  # 转出可安装的 .pkg.tar.zst
+  alltap package.rpm -o ~/pkgs        # 指定输出目录
+  alltap package.deb -p               # 只生成 PKGBUILD (debtap 兼容)
+  alltap program.AppImage -n prog     # AppImage 重打包
+  alltap a.deb b.rpm -i               # 多包单事务安装 (依赖互相满足)
+  alltap a.deb -i --dry-run           # 预演: 输出安装计划, 不实际执行
+  alltap a.deb -i --aur               # 缺失依赖时查询 AUR 兜底补装
+  alltap --refresh                    # 刷新 Arch 仓库包名缓存
+""")
+    ap.add_argument("packages", nargs="*", help="待转换的包文件 (可多个)")
+    ap.add_argument("-p", "--pkgbuild", action="store_true", help="仅生成 PKGBUILD, 不直接打包")
+    ap.add_argument("-o", "--output", default=".", help="输出目录 (默认当前目录)")
+    ap.add_argument("-n", "--name", help="覆盖包名")
+    ap.add_argument("-d", "--desc", dest="desc", help="覆盖描述")
+    ap.add_argument("-u", "--url", help="覆盖主页")
+    ap.add_argument("-l", "--license", help="覆盖许可证")
+    ap.add_argument("-a", "--arch", help="覆盖架构")
+    ap.add_argument("-v", "--pkgver", dest="version",
+                    help="覆盖包版本 (AppImage/tarball; -v 短选项与 debtap 兼容)")
+    ap.add_argument("--prefix", default="/opt/{pkgname}", help="AppImage/归档的安装前缀 (默认 /opt/{pkgname})")
+    ap.add_argument("-k", "--keep-unknown-deps", action="store_true",
+                    help="无法翻译的依赖保持原名保留 (默认剔除)")
+    ap.add_argument("--no-scripts", action="store_true", help="不移植安装/卸载脚本")
+    ap.add_argument("-i", "--install", action="store_true",
+                    help="转换后自动 pacman -U 安装 (多包为单事务, 依赖互相满足); 失败自动修复重试")
+    ap.add_argument("--aur", action="store_true",
+                    help="仓库缺失依赖时查询 AUR, 征得同意后用 yay/paru 补装 (需已安装其一)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只输出安装计划 (将补装哪些依赖/覆盖哪些文件), 不实际执行")
+    ap.add_argument("--max-tries", type=int, default=5, help="安装修复循环上限 (默认 5)")
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="自动确认: 补装依赖 / 移除未知依赖 / 精确覆盖冲突文件")
+    ap.add_argument("--no-autodeps", action="store_true", help="禁止自动补装仓库内缺失依赖")
+    ap.add_argument("--no-overwrite", action="store_true", help="禁止自动处理文件冲突")
+    ap.add_argument("-f", "--force", action="store_true", help="覆盖已有输出目录")
+    ap.add_argument("--refresh", action="store_true", help="刷新 Arch 仓库包名缓存后退出")
+    ap.add_argument("-V", "--version", "--show-version", dest="show_version",
+                    action="store_true", help="显示 alltap 版本")
+    ap.add_argument("-q", "--quiet", action="store_true", help="安静模式")
+    ap.add_argument("--verbose", action="store_true", help="显示细节")
+    args = ap.parse_args()
+
+    log.quiet = args.quiet
+    log.verbose = args.verbose
+
+    if args.show_version:
+        print(f"{PROG} {VERSION}")
+        return 0
+    if args.refresh:
+        cache = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+                             "alltap", "arch-repo-names.txt")
+        if os.path.exists(cache):
+            os.remove(cache)
+        arch_repo_names()
+        print("Arch 仓库包名缓存已刷新")
+        return 0
+    if not args.packages:
+        ap.print_help()
+        return 1
+
+    for p in args.packages:
+        if not os.path.exists(p):
+            die(f"文件不存在: {p}")
+    # 安装/预演模式下保留未识别依赖, 交由 pacman 判定仓库有无并触发修复回路
+    if (args.install or args.dry_run) and not args.keep_unknown_deps:
+        args.keep_unknown_deps = True
+        log.verb("安装/预演模式: 未识别依赖将保留原名, 由安装闭环判定处理")
+    # translator 提前挂到 args 上
+    args.translator = Translator(args)
+
+    ok, fail, specs = [], [], []
+    for p in args.packages:
+        try:
+            r = convert_one(p, args)
+            if r is None:
+                fail.append(os.path.basename(p))
+            else:
+                ok.append(os.path.basename(p))
+                if isinstance(r, PKGSpec):
+                    specs.append(r)
+        except Exception as e:
+            if log.verbose:
+                import traceback
+                traceback.print_exc()
+            log.warn(f"转换 {os.path.basename(p)} 失败: {e}")
+            fail.append(os.path.basename(p))
+            continue
+
+    # 多包事务: 全部转换成功后一次 pacman -U (依赖互相满足) / --dry-run 出计划
+    if specs:
+        try:
+            if args.dry_run:
+                dry_run_report(specs, PacmanRunner(args), args)
+            else:
+                ok_install = install_transaction(specs, args)
+                if not ok_install:
+                    log.warn("安装事务未成功; 成品包与报告已保留, 可手动处理 (-U 手动安装)")
+        finally:
+            for sp in specs:           # 统一清理重打包用临时目录
+                shutil.rmtree(sp.work, ignore_errors=True)
+
+    print()
+    if not log.quiet:
+        print(f"完成: {len(ok)} 个成功" + (f", {len(fail)} 个失败 {fail}" if fail else ""))
+        if ok:
+            print("提示: 未经校验的第三方包可能带来安全与稳定性问题, 建议拆包审计后使用 (pacman -Qlp 查看内容)")
+    return 0 if not fail else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
