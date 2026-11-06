@@ -44,7 +44,7 @@ alltap package.deb -p                 # PKGBUILD only (debtap-compatible mode)
 alltap package.deb -o ~/pkgs          # custom output directory
 alltap program.rpm -k                 # keep untranslatable deps verbatim
 alltap any.rpm -v 2.1-3               # override package version (all formats; -v kept for debtap compat)
-alltap app.tar.gz --prefix /usr/local # install prefix for archive without system tree (default /opt/{pkgname})
+alltap app.tar.gz --prefix /usr/local # prefix when there is no system tree (default /opt/{pkgname}; also honored by -p AppImage)
 alltap a.deb b.rpm -i                 # install after conversion, multi-package single transaction
 alltap a.deb b.rpm -i --dry-run       # rehearsal: print the install plan, install nothing
 alltap a.deb -i --aur                 # fall back to AUR for missing deps, with confirmation
@@ -146,10 +146,10 @@ Untranslatable dependencies are dropped by default and summarized at the end (`-
 ## Development & testing
 
 ```bash
-bash tests/run-tests.sh          # conversion regression: 7 formats + PKGBUILD + repack (10/10)
+bash tests/run-tests.sh          # conversion regression: 7 formats + PKGBUILD + repack + 4 P1 regressions (14/14)
 bash tests/test-install-mock.sh  # install-loop mock tests: 10 scenarios (multi-pkg/AUR/dry-run incl.)
 bash tests/test-install-real.sh  # real-pacman isolated tests (unshare + throwaway root, 6/6)
-python3 tests/build-fixtures.py  # rebuild all test fixtures (13)
+python3 tests/build-fixtures.py  # rebuild all test fixtures (16)
 ```
 
 All fixtures are generated programmatically (hand-crafted valid RPM/cpio streams, ar archives, `.PKGINFO`), plus a real hello RPM downloaded from the official Fedora repository.

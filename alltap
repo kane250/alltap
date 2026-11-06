@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# encoding declaration
 """
 alltap — 把 (几乎) 所有 Linux 软件包转换成 Arch Linux 软件包
 
@@ -31,6 +32,17 @@ alltap — 把 (几乎) 所有 Linux 软件包转换成 Arch Linux 软件包
   * 临时解包目录统一用 alltap-<fmt>- 前缀, 生命周期由调用方管理
     (正常转换: convert_one 内清理; -i/--dry-run: 主流程 finally 统一清理)
   * 依赖翻译是"尽力而为": 未识别默认剔除, -k 保留原名, -i/--dry-run 下自动保留交由 pacman 判定
+
+alltap — convert (almost) any Linux package into an Arch Linux package.
+
+Supported inputs: .deb, .rpm (pure Python parser), .apk, Slackware .tgz/.txz,
+.AppImage, generic tarballs and Arch .pkg.tar.zst.
+
+Output: an installable .pkg.tar.zst by default, or a PKGBUILD with -p.
+
+Pipeline: detect format -> handler unpacks and fills Metadata -> dependency
+translation -> build .PKGINFO/.INSTALL/.MTREE and compress -> optional
+pacman -U install with a diagnose/repair/retry loop.
 """
 
 import argparse
@@ -50,6 +62,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
+from urllib.parse import quote
 from typing import Dict, List, Optional, Tuple
 
 PROG = "alltap"
@@ -57,6 +70,7 @@ VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # 通用小工具
+# general helpers
 # ---------------------------------------------------------------------------
 
 class Log:
@@ -66,6 +80,12 @@ class Log:
       info  普通进度, -q 时静默
       verb  细节 (-verbose), 统一缩进 4 空格便于区分层级
       warn  警告, 走 stderr 且带"警告:"前缀, 不因 -q 之外的原因被吞掉
+
+    Global logger (singleton log).
+
+    Deliberately minimal instead of the logging module:
+    info = progress (silent with -q), verb = details (--verbose, indented),
+    warn = warnings on stderr with a prefix.
     """
 
     def __init__(self):
@@ -78,16 +98,21 @@ class Log:
 
     def verb(self, msg):
         # 只有显式 --verbose 才输出, 用于依赖翻译/命令回显等排查信息
+        # printed only with --verbose; used for dependency translation / command echo diagnostics
         if self.verbose and not self.quiet:
             print("    " + msg)
 
     def warn(self, msg):
         # 警告走 stderr, 保证管道重定向 stdout 时仍能看到问题
+        # warnings go to stderr so they remain visible when stdout is piped
         if not self.quiet:
             print(f"  警告: {msg}", file=sys.stderr)
 
     def drop_list(self, kind, items):
-        """收集被丢弃/未翻译的条目, 退出前统一提示"""
+        """收集被丢弃/未翻译的条目, 退出前统一提示
+
+        Collect dropped/untranslated items and report them together before exit.
+        """
         if items and not self.quiet:
             print(f"  注意: 以下 {kind} 已被{ '剔除' if kind.startswith('依赖') else '忽略' }: {', '.join(sorted(set(items)))}")
 
@@ -100,6 +125,12 @@ def die(msg, code=1):
     注意: 抛的是 SystemExit(BaseException), main() 里按文件循环的
     `except Exception` 捕获不到, 因此任何 die 都会终止整批处理.
     handler 内部对"可恢复的解析失败"应抛 ValueError 而不是 die.
+
+    Print an error and exit immediately.
+
+    Raises SystemExit (a BaseException), so a per-file ``except Exception`` cannot
+    catch it. Recoverable parse failures inside handlers should raise ValueError
+    instead of calling die().
     """
     print(f"错误: {msg}", file=sys.stderr)
     sys.exit(code)
@@ -109,17 +140,25 @@ def run(cmd, **kw):
     """执行外部命令; check=True, 非零退出码抛 CalledProcessError.
 
     统一 capture_output, 调用方需要输出时自己 decode (见 bsdtar_list).
+
+    Run an external command; check=True, so a non-zero exit raises CalledProcessError.
+
+    Output is always captured; callers decode it themselves (see bsdtar_list).
     """
     log.verb("$ " + " ".join(cmd))
     return subprocess.run(cmd, check=True, capture_output=True, text=False, **kw)
 
 
 def which(cmd):
-    """PATH 中是否存在可执行文件 (shutil.which 的薄封装, 便于统一替换)."""
+    """PATH 中是否存在可执行文件 (shutil.which 的薄封装, 便于统一替换).
+
+    Return True when the command exists in PATH (thin wrapper around shutil.which).
+    """
     return shutil.which(cmd) is not None
 
 # ---------------------------------------------------------------------------
 # 元数据模型
+# metadata model
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -129,13 +168,21 @@ class Dep:
     内部统一用"拆开"的三元组表示, 输出时再拼成 pacman 的 name<op>ver,
     好处是修复循环里可以只改 op/ver (放宽版本) 而不动 name.
     op 为空表示不约束版本; ver 仅在 op 非空时有意义.
+
+    One dependency: name plus optional comparison operator and version.
+
+    The three fields are kept separate so the repair loop can relax only the
+    operator/version without touching the name.
     """
     name: str
     op: Optional[str] = None    # < <= = >= >
     ver: Optional[str] = None
 
     def to_pacman(self):
-        """拼成 .PKGINFO / pacman -U 接受的依赖串, 如 glibc>=2.38."""
+        """拼成 .PKGINFO / pacman -U 接受的依赖串, 如 glibc>=2.38.
+
+        Render the pacman dependency string, e.g. glibc>=2.38.
+        """
         return f"{self.name}{self.op or ''}{self.ver or ''}"
 
 
@@ -147,6 +194,12 @@ class Metadata:
     "epoch:version-release"; pkgfilename 直接生成 makepkg 风格文件名.
     scripts 的键是 .INSTALL 里的函数名 (post_install 等), 特殊键 __raw__
     表示 Arch 包重打包时原样保留的 .INSTALL 全文.
+
+    Unified intermediate representation of source package metadata.
+
+    Field names follow Arch conventions: version and release are stored separately
+    and fullver joins them as "epoch:version-release". Keys in scripts are .INSTALL
+    function names; the special key __raw__ keeps an original .INSTALL verbatim.
     """
 
     name: str = "unknown"
@@ -160,21 +213,30 @@ class Metadata:
     license: str = "unknown"
     depends: List[Dep] = field(default_factory=list)
     optdepends: List[str] = field(default_factory=list)   # 已是 "pkg: 说明" 形式
+    # already in "pkg: description" form
     provides: List[str] = field(default_factory=list)
     conflicts: List[str] = field(default_factory=list)
     replaces: List[str] = field(default_factory=list)
+    groups: List[str] = field(default_factory=list)
     scripts: Dict[str, str] = field(default_factory=dict)  # .INSTALL 函数名 -> 函数体
+    # .INSTALL function name -> function body
     source_fmt: str = ""
 
     @property
     def fullver(self):
-        """完整版本串 "[epoch:]version-pkgrel" — 用于 .PKGINFO 与文件名."""
+        """完整版本串 "[epoch:]version-pkgrel" — 用于 .PKGINFO 与文件名.
+
+        Full version string "[epoch:]version-pkgrel" — used in .PKGINFO and filenames.
+        """
         e = f"{self.epoch}:" if self.epoch else ""
         return f"{e}{self.version}-{self.release}"
 
     @property
     def pkgfilename(self):
-        """makepkg 风格文件名: <name>-<fullver>-<arch>.pkg.tar.zst."""
+        """makepkg 风格文件名: <name>-<fullver>-<arch>.pkg.tar.zst.
+
+        makepkg-style filename: <name>-<fullver>-<arch>.pkg.tar.zst.
+        """
         return f"{self.name}-{self.fullver}-{self.arch}.pkg.tar.zst"
 
 
@@ -183,6 +245,11 @@ def sanitize_pkgname(name: str) -> str:
 
     规则: 小写; 空白转 '-'; 仅保留 [a-z0-9@._+-]; 去掉开头的 '.'/'-'
     (pkgname 不能以这两个字符开头). 结果为空时回退为 "pkg".
+
+    Normalize an arbitrary package name to the character set pacman allows.
+
+    Lowercase, whitespace to '-', keep [a-z0-9@._+-], strip leading '.'/'-'.
+    Falls back to "pkg" when the result is empty.
     """
     n = name.lower().strip()
     n = re.sub(r"\s+", "-", n)
@@ -192,7 +259,10 @@ def sanitize_pkgname(name: str) -> str:
 
 
 def sanitize_ver(v: str) -> str:
-    """pacman:版本段不得含 '-', 允许 [A-Za-z0-9_.+:]; 不得以 '.'/'-' 开头"""
+    """pacman:版本段不得含 '-', 允许 [A-Za-z0-9_.+:]; 不得以 '.'/'-' 开头
+
+    pacman version segment: no '-', only [A-Za-z0-9_.+:], must not start with '.'/'-'.
+    """
     v = v.strip().replace(" ", "_")
     v = re.sub(r"[^A-Za-z0-9_.+]", "_", v)
     v = v.lstrip(".-_")
@@ -201,7 +271,12 @@ def sanitize_ver(v: str) -> str:
 
 def sanitize_rel(r: str) -> str:
     """pkgrel 规范化为 makepkg 要求的 integer[.integer];
-    ubuntu 后缀(如 2ubuntu1)转成 2.1, 其余非数字字符丢弃"""
+    ubuntu 后缀(如 2ubuntu1)转成 2.1, 其余非数字字符丢弃
+
+    Normalize pkgrel to the integer[.integer] form required by makepkg.
+
+    Ubuntu suffixes such as 2ubuntu1 become 2.1; other non-digits are dropped.
+    """
     r = r.strip()
     m = re.match(r"^(\d+)", r)
     if not m:
@@ -214,6 +289,7 @@ def sanitize_rel(r: str) -> str:
 
 # ---------------------------------------------------------------------------
 # ar 归档解析 (用于 .deb)
+# ar archive parsing (the outer container of .deb)
 # ---------------------------------------------------------------------------
 
 def parse_ar(path: str) -> List[Tuple[str, bytes]]:
@@ -228,6 +304,16 @@ def parse_ar(path: str) -> List[Tuple[str, bytes]]:
     已知局限: 不支持 GNU 长名表 (//) 与 /<offset> 间接引用 — deb 的成员名
     (debian-binary/control.tar.*/data.tar.*) 都足够短, 不受影响.
     实现上整体读入内存: deb 通常几 MB~几十 MB, 可接受.
+
+    Parse an ar archive (the outer container of .deb); returns ordered (name, bytes).
+
+    ar layout: global magic "!<arch>\n"; each member has a 60-byte ASCII header
+    with the name at [0:16] and the decimal size at [48:58]; odd-sized members are
+    padded with one byte. A trailing '/' in the name is a GNU truncation marker.
+
+    Limitation: GNU long-name tables (//) and /<offset> references are unsupported;
+    deb member names are short enough and are unaffected. The whole file is read
+    into memory, which is acceptable for typical debs.
     """
     data = open(path, "rb").read()
     if data[:8] != b"!<arch>\n":
@@ -243,11 +329,13 @@ def parse_ar(path: str) -> List[Tuple[str, bytes]]:
         members.append((name, body))
         pos += 60 + size
         if pos & 1:          # ar 成员按 2 字节对齐
+                             # ar members are 2-byte aligned
             pos += 1
     return members
 
 # ---------------------------------------------------------------------------
 # bsdtar 封装
+# bsdtar wrappers
 # ---------------------------------------------------------------------------
 
 def bsdtar_extract(archive: str, dest: str, exclude_prefixes: List[str] = None):
@@ -256,6 +344,11 @@ def bsdtar_extract(archive: str, dest: str, exclude_prefixes: List[str] = None):
     选 bsdtar 而不是 tarfile: 它一个工具同时支持 tar/gzip/xz/bzip2/zstd/ar,
     且对权限位/符号链接/硬链接的处理与 makepkg 一致. exclude_prefixes
     用于排除包管理器元文件目录.
+
+    Extract an archive with bsdtar into dest (created automatically).
+
+    bsdtar handles tar/gzip/xz/bzip2/zstd/ar in one tool and preserves permission
+    bits, symlinks and hardlinks the same way makepkg does.
     """
     if not which("bsdtar"):
         die("缺少 bsdtar (libarchive), 请先安装: sudo pacman -S libarchive")
@@ -270,27 +363,20 @@ def bsdtar_list(archive: str) -> List[str]:
     """列出归档成员路径 (不解包), 用于格式探测与顶层目录推断.
 
     输出可能包含目录条目 (以 / 结尾) 与重复名, 由调用方自行处理.
+
+    List archive member paths without extracting (used by format detection and
+    top-level directory inference). Directory entries end with '/' and names may
+    repeat; callers handle both.
     """
     out = run(["bsdtar", "-tf", archive])
     return [ln for ln in out.stdout.decode("utf8", "replace").splitlines() if ln.strip()]
 
 # ---------------------------------------------------------------------------
 # cpio(newc) 解析 — 用于 RPM payload, 纯 Python
+# cpio(newc) parsing — pure Python, for the RPM payload
 # ---------------------------------------------------------------------------
 
 CPIO_MAGIC = (b"070701", b"070702")
-
-
-class CpioEntry:
-    """cpio 条目字段容器 — 目前仅作为格式说明保留, 未被实际使用.
-
-    newc 头的 13 个字段 (全部 8 位十六进制):
-      ino, mode, uid, gid, nlink, mtime, filesize,
-      devmajor, devminor, rdevmajor, rdevminor, namesize, check
-    保留此类是为了后续需要按条目流式处理时不至于重推字段顺序;
-    当前实现直接在 extract_cpio_newc 里解包, 不构造对象.
-    """
-    __slots__ = ("mode", "filepath", "target", "data", "islnk", "isdir", "isreg")
 
 
 def extract_cpio_newc(stream, destdir: str):
@@ -304,6 +390,16 @@ def extract_cpio_newc(stream, destdir: str):
     安全性: 拒绝含 '..' 的路径 (防 tar-slip 式穿越); 且以 lstrip("./") 去掉
     rpm 常见的 "./" 前缀, 保证落盘位置始终在 destdir 下.
     设备/管道/套接字等非常规类型直接跳过 (Arch 包不应携带它们).
+
+    Extract a decompressed cpio(newc) byte stream into destdir; returns entry count.
+
+    Header: 110 bytes = 6-byte magic (070701/070702) + 13 x 8 hex fields.
+    Alignment trap: the name area starts at offset 110, so name padding is based on
+    (110 + namesize) mod 4, while file data padding is based on filesize mod 4.
+
+    Safety: reject paths containing '..' (tar-slip style traversal) and strip the
+    leading './' that rpm payloads commonly use, so writes stay under destdir.
+    Devices/FIFOs/sockets are skipped because Arch packages must not carry them.
     """
     count = 0
     while True:
@@ -317,6 +413,7 @@ def extract_cpio_newc(stream, destdir: str):
          _devmaj, _devmin, _rmaj, _rmin, namesize, _chk) = f
         name = stream.read(namesize - 1).decode("utf8", "replace")
         stream.read(1)  # NUL
+                        # NUL terminator
         pad = (110 + namesize) & 3
         if pad:
             stream.read(4 - pad)
@@ -327,6 +424,7 @@ def extract_cpio_newc(stream, destdir: str):
         if name == "TRAILER!!!":
             break
         # 防路径穿越
+        # prevent path traversal
         name = name.lstrip("./")
         if not name or ".." in name.split("/"):
             continue
@@ -334,27 +432,33 @@ def extract_cpio_newc(stream, destdir: str):
         ftype = mode & 0o170000
         os.makedirs(os.path.dirname(target), exist_ok=True)
         if ftype == 0o040000:                       # 目录
+                                                    # directory
             os.makedirs(target, exist_ok=True)
         elif ftype == 0o120000:                     # 符号链接
+                                                    # symlink
             linkto = data.decode("utf8", "replace")
             if os.path.lexists(target):
                 os.remove(target)
             os.symlink(linkto, target)
         elif ftype == 0o100000:                     # 普通文件
+                                                    # regular file
             with open(target, "wb") as fp:
                 fp.write(data)
             # 恢复权限位 (去掉高位类型位)
+            # restore permission bits (strip the high type bits)
             try:
                 os.chmod(target, mode & 0o7777)
             except OSError:
                 pass
         else:                                        # 设备/管道/套接字: 忽略
+                                                     # device/fifo/socket: skip
             log.verb(f"跳过非常规 cpio 条目: {name} (type={oct(ftype)})")
         count += 1
     return count
 
 # ---------------------------------------------------------------------------
 # RPM 解析 — lead + 签名 header + 主 header + payload
+# RPM parsing — lead + signature header + main header + payload
 # ---------------------------------------------------------------------------
 
 RPM_TAGS = {
@@ -377,27 +481,12 @@ RPM_TAGS = {
 T = RPM_TAGS
 
 
-def _rpm_read_header(f) -> Tuple[list, bytes]:
-    """从文件流读一个 RPM header (遗留调试工具, 主流程未使用).
-
-    注意: 这里仍按完整 8 字节 magic 校验, 而 parse_rpm.read_header() 只校验
-    前 4 字节 (rpm 4.24+ 尾部 version/reserved 字节有差异). 若未来启用本函数,
-    需同步放宽校验, 否则新格式 RPM 会直接报"非法 magic".
-    """
-    magic = f.read(8)
-    if magic != b"\x8e\xad\xe8\x01\x01\x00\x00\x00":
-        raise ValueError("非法 RPM header magic")
-    (nindex, hsize) = struct.unpack(">II", f.read(8))
-    entries = []
-    for _ in range(nindex):
-        tag, typ, off, cnt = struct.unpack(">IIII", f.read(16))
-        entries.append((tag, typ, off, cnt))
-    store = f.read(hsize)
-    return entries, store
-
-
 def _rpm_entry_value(typ, cnt, off, store):
-    """按 rpm tag 类型从 store 中读取值 (offset 由 writer 按类型对齐)"""
+    """按 rpm tag 类型从 store 中读取值 (offset 由 writer 按类型对齐)
+
+    Read a value from the rpm header store according to its tag type
+    (offset is aligned by the writer per type).
+    """
     if typ in (6, 8, 9):    # STRING / STRING_ARRAY / I18NSTRING
         vals = []
         p = off
@@ -427,11 +516,18 @@ class RpmInfo:
 
     f 的键是数字 tag (见 RPM_TAGS), 值已按 tag 类型解码为 str/int list/bytes.
     payload_to 不预先解包, 只有真正需要文件树时才调用, 避免纯元数据场景的空开销.
+
+    RPM parse result: metadata fields plus a lazy payload extraction callback.
+
+    f maps numeric tags (see RPM_TAGS) to decoded values. payload_to is only called
+    when the file tree is actually needed, avoiding work for metadata-only use.
     """
 
     def __init__(self, fields, payload_to, compressor):
         self.f = fields                       # {tag号: 值}
+                                              # {tag number: value}
         self.payload_to = payload_to          # callable(dest) -> 解出文件数量
+                                              # callable(dest) -> number of extracted files
         self.compressor = compressor
 
 
@@ -446,33 +542,56 @@ def parse_rpm(path: str) -> RpmInfo:
         索引表里的 offset 是相对存储区起点的偏移;
       * payload 从主 header 末尾一直延伸到文件末尾, 压缩方式由 PAYLOADCOMPRESSOR 决定.
 
-    局限: 整体读入内存, 超大 RPM (数百 MB) 会吃内存; 如需处理可改为 mmap/分块.
+    实现只把 header 读进内存, payload 按需从文件流式解压 (可处理数百 MB 的 RPM).
+
+    Pure-Python RPM parser: lead(96) + signature header + main header + compressed cpio payload.
+
+    Layout notes:
+      * the first 4 bytes \xed\xab\xee\xdb are the lead magic; the lead is 96 bytes;
+      * the main header must be aligned to 8 bytes by ABSOLUTE file offset
+        (not relative) after the signature header — a classic rpm pitfall;
+      * header = 8-byte magic + nindex/hsize + nindex x 16-byte index table + hsize store;
+        offsets in the index table are relative to the start of the store;
+      * the payload runs from the end of the main header to EOF; PAYLOADCOMPRESSOR
+        selects the decompressor.
+
+    Only headers are held in memory; the payload is streamed from disk, so very
+    large RPMs are handled without loading them whole.
     """
-    import io
-    data = open(path, "rb").read()
-    if data[:4] != b"\xed\xab\xee\xdb":
-        raise ValueError("非法 RPM lead magic")
-    pos = 96  # lead 长度固定 96
 
-    def read_header(pos0):
-        """从 data[pos0] 读一个 rpm header, 返回 (索引表, 存储区, 下一个 header 的偏移)."""
-        magic = data[pos0:pos0 + 4]   # rpm 4.24+ 尾部 version/reserved 字节有差异, 只校验前 4 字节
-        if magic != b"\x8e\xad\xe8\x01":
+    def read_header_at(fh) -> Tuple[list, bytes, int]:
+        """从当前文件位置读一个 rpm header, 返回 (索引表, 存储区, 读取后的偏移).
+
+        Read one rpm header from the current file position; returns
+        (index table, store, offset after reading).
+        """
+        hdr = fh.read(16)
+        # rpm 4.24+ 尾部 version/reserved 字节有差异, 只校验前 4 字节
+        # rpm 4.24+ differs in trailing version/reserved bytes; validate the first 4 bytes only
+        if len(hdr) < 16 or hdr[:4] != b"\x8e\xad\xe8\x01":
             raise ValueError("非法 RPM header magic")
-        nindex, hsize = struct.unpack(">II", data[pos0 + 8:pos0 + 16])
+        nindex, hsize = struct.unpack(">II", hdr[8:16])
+        raw = fh.read(nindex * 16)
+        if len(raw) < nindex * 16:
+            raise ValueError("RPM header 索引表截断")
         entries = []
-        p = pos0 + 16
-        for _ in range(nindex):
-            tag, typ, off, cnt = struct.unpack(">IIII", data[p:p + 16])
+        for i in range(nindex):
+            tag, typ, off, cnt = struct.unpack(">IIII", raw[i * 16:(i + 1) * 16])
             entries.append((tag, typ, off, cnt))
-            p += 16
-        store = data[p:p + hsize]
-        return entries, store, p + hsize
+        store = fh.read(hsize)
+        if len(store) < hsize:
+            raise ValueError("RPM header 存储区截断")
+        return entries, store, fh.tell()
 
-    # 签名 header 后按 8 字节(绝对文件偏移)对齐到主 header
-    _se, _ss, spos = read_header(pos)
-    spos += (8 - (spos % 8)) % 8
-    entries, store, pend = read_header(spos)
+    with open(path, "rb") as fh:
+        lead = fh.read(96)
+        if len(lead) < 96 or lead[:4] != b"\xed\xab\xee\xdb":
+            raise ValueError("非法 RPM lead magic")
+        # 签名 header 后按 8 字节(绝对文件偏移)对齐到主 header
+        # the main header is aligned to 8 bytes by absolute file offset after the signature header
+        _se, _ss, spos = read_header_at(fh)
+        fh.seek((8 - (spos % 8)) % 8, os.SEEK_CUR)
+        entries, store, payload_off = read_header_at(fh)
 
     fields = {}
     for (tag, typ, off, cnt) in entries:
@@ -482,35 +601,44 @@ def parse_rpm(path: str) -> RpmInfo:
             log.verb(f"rpm tag {tag} 解析失败: {e}")
 
     compressor = fields.get(T["PAYLOADCOMPRESSOR"], "gzip")
-    payload_raw = data[pend:]
 
     def payload_to(dest: str) -> int:
         """按 PAYLOADCOMPRESSOR 选择解压器, 再交给 cpio newc 解析器.
 
-        gzip/xz/bzip2 走标准库 (无外部依赖); zstd 标准库没有,
-        只能调 zstd 命令 (这也是本工具唯一强依赖的额外解压器).
+        gzip/xz/bzip2 走标准库; zstd 标准库没有, 只能调 zstd 命令.
+        整条链路都是流式的, 不会把 payload 一次性载入内存.
+
+        Choose a decompressor per PAYLOADCOMPRESSOR, then hand it to the cpio newc parser.
+
+        gzip/xz/bzip2 use the standard library; zstd has no stdlib support and requires
+        the zstd command. The whole chain is streamed and never loads the payload whole.
         """
-        if compressor == "gzip":
-            stream = gzip.GzipFile(fileobj=io.BytesIO(payload_raw))
-        elif compressor in ("xz", "lzma"):
-            stream = lzma.LZMAFile(io.BytesIO(payload_raw))
-        elif compressor == "bzip2":
-            stream = bz2.BZ2File(io.BytesIO(payload_raw))
-        elif compressor.startswith("zstd"):
-            if not which("zstd"):
-                die("RPM payload 为 zstd 压缩, 需要 zstd 工具")
-            proc = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE)
-            out, _ = proc.communicate(payload_raw)
-            stream = io.BytesIO(out)
-        else:
+        with open(path, "rb") as pf:
+            pf.seek(payload_off)
+            if compressor == "gzip":
+                return extract_cpio_newc(gzip.GzipFile(fileobj=pf), dest)
+            if compressor in ("xz", "lzma"):
+                return extract_cpio_newc(lzma.LZMAFile(pf), dest)
+            if compressor == "bzip2":
+                return extract_cpio_newc(bz2.BZ2File(pf), dest)
+            if compressor.startswith("zstd"):
+                if not which("zstd"):
+                    die("RPM payload 为 zstd 压缩, 需要 zstd 工具")
+                proc = subprocess.Popen(["zstd", "-dc"], stdin=pf, stdout=subprocess.PIPE)
+                try:
+                    count = extract_cpio_newc(proc.stdout, dest)
+                finally:
+                    proc.stdout.close()
+                if proc.wait() != 0:
+                    raise ValueError("zstd 解压 RPM payload 失败")
+                return count
             die(f"不支持的 RPM payload 压缩: {compressor}")
-        return extract_cpio_newc(stream, dest)
 
     return RpmInfo(fields, payload_to, compressor)
 
 
 # rpm 依赖 flags (rpmds.h)
+# rpm dependency flags (rpmds.h)
 RPMSENSE_LESS, RPMSENSE_GREATER, RPMSENSE_EQUAL = 2, 4, 8
 
 
@@ -520,6 +648,11 @@ def rpm_sense_to_op(flags: int) -> Optional[str]:
     rpmds.h 里 LESS=2, GREATER=4, EQUAL=8, 可组合:
       2 -> <, 4 -> >, 8 -> =, 2|8 -> <=, 4|8 -> >=
       2|4 (=<>) 是区间约束, pacman 无法表达, 退化为"无版本".
+
+    Translate the low 4 bits of rpm dependency flags into a comparison operator.
+
+    rpmds.h: LESS=2, GREATER=4, EQUAL=8; combinable as 2|8 (<=), 4|8 (>=).
+    2|4 (<>) is a range that pacman cannot express and degrades to unversioned.
     """
     s = flags & 0xF
     if s == RPMSENSE_EQUAL:
@@ -530,6 +663,7 @@ def rpm_sense_to_op(flags: int) -> Optional[str]:
         return ">"
     if s == (RPMSENSE_LESS | RPMSENSE_GREATER):
         return None   # <> 范围, pacman 无法表达, 视作无版本
+                      # <> range cannot be expressed by pacman; treat it as unversioned
     if s == (RPMSENSE_LESS | RPMSENSE_EQUAL):
         return "<="
     if s == (RPMSENSE_GREATER | RPMSENSE_EQUAL):
@@ -538,6 +672,7 @@ def rpm_sense_to_op(flags: int) -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 # 格式探测
+# format detection
 # ---------------------------------------------------------------------------
 
 def detect_format(path: str) -> str:
@@ -555,34 +690,59 @@ def detect_format(path: str) -> str:
 
     为什么不只靠后缀: 用户经常把下载文件重命名; 为什么不只靠内容:
     apk 与 Arch 包的头部特征高度重叠, 文件名是成本最低的区分手段.
+
+    Detect the input package format and return a HANDLERS key.
+
+    Priority, from reliable to heuristic:
+      1. strong magic: RPM lead / ar archive -> final;
+      2. AppImage: ELF file named *.AppImage;
+      3. compressed stream (gzip/xz/bzip2/zstd) or ustar: could be apk, Arch
+         package, Slackware or a plain tarball; check the filename suffix first,
+         then list the first members with bsdtar:
+           - .MTREE -> Arch package
+           - .SIGN.* / first member .PKGINFO -> Alpine apk
+           - install/ and a Slackware-style filename -> slack
+      4. everything else is a tarball (pkg_tarball decides system tree vs /opt).
+
+    Filename matters because users rename downloads; content alone is ambiguous
+    because apk and Arch packages share very similar headers.
     """
     fn = os.path.basename(path).lower()
     with open(path, "rb") as f:
         head = f.read(0x4000)      # 读 16KB 足以覆盖所有 magic 与 tar 头
+                                   # 16KB is enough to cover all magic and tar headers
 
     # --- magic 判定优先 ---
+    # --- magic-based detection first ---
     if head.startswith(b"\xed\xab\xee\xdb"):
         return "rpm"
     if head[:8] == b"!<arch>\n":
         return "deb"
     # .dtb? no. Alpine apk: gzip 流且成员名以 .PKGINFO/.SIGN 开头
+    # not a .dtb. Alpine apk: a gzip stream whose members start with .PKGINFO/.SIGN
     is_gz = head[:2] == b"\x1f\x8b"
     is_xz = head[:6] == b"\xfd7zXZ\x00"
     is_bz2 = head[:3] == b"BZh"
     is_zst = head[:4] == b"\x28\xb5\x2f\xfd"
 
     # AppImage: ELF 且文件名 .AppImage
+    # AppImage: an ELF file whose name ends with .AppImage
     if head[:4] == b"\x7fELF" and fn.endswith(".appimage"):
         return "appimage"
 
-    # 注意: 此条件已包含未压缩 tar (ustar), 因此下方 "未压缩 tar" 判断实际不可达.
+    # 注意: 该条件已包含未压缩 tar (ustar), 会进入本分支按内容继续判定.
+    # note: this condition already includes uncompressed tar (ustar); such files enter this branch
+    # and are inspected by content.
     if is_gz or is_xz or is_bz2 or is_zst or head[:8] == b"ustar  \0" or head[:8] == b"ustar\x0000":
         if fn.endswith(".apk"):
             return "apk"
         # Arch 包按文件名优先判定 (避免与 apk 的 .PKGINFO 首成员混淆)
+        # Arch packages are identified by filename first (avoids confusion with apk's .PKGINFO first
+        # member)
         if fn.endswith((".pkg.tar.zst", ".pkg.tar.xz", ".pkg.tar.gz", ".pkg.tar")):
             return "archpkg"
         # 看归档首条目判断类型
+        # inspect the first archive members to decide the type
         names = []
         try:
             names = bsdtar_list(path)
@@ -599,18 +759,17 @@ def detect_format(path: str) -> str:
         if any(n.split("/")[0] == "install" for n in names) and re.search(r"-[^-]+-[^-]+-\d+\.(tgz|txz)$", fn, re.I):
             return "slack"
         # tarball: 系统树 or 普通归档
+        # tarball: system tree or plain archive
         return "tarball"
     if head == b"":
         die(f"空文件: {path}")
-    # 未压缩 tar 已在上面分支处理, 此处仅作防御性保留 (实际不可达)
-    if head[:8] in (b"ustar  \0", b"ustar\x0000"):
-        return "tarball"
     if fn.endswith(".appimage"):
         return "appimage"
     die(f"无法识别的包格式: {path}\n支持: .deb .rpm .apk .tgz/.txz .AppImage .tar.* .pkg.tar.zst")
 
 # ---------------------------------------------------------------------------
 # 依赖翻译引擎
+# dependency translation engine
 # ---------------------------------------------------------------------------
 
 def find_map_file() -> str:
@@ -618,13 +777,23 @@ def find_map_file() -> str:
 
     搜索顺序: $ALLTAP_MAP -> 开发目录 data/ -> ../share 安装布局 -> 用户级 -> 系统级.
     同时兼容三种安装形态: 源码目录直接跑、usr/bin + usr/share、bin + share.
+
+    Find the dependency map by priority; return "" when none is found (caller
+    falls back to EMBEDDED_MAP).
+
+    Order: $ALLTAP_MAP -> source-tree data/ -> ../share layouts -> user -> system.
+    Supports source-tree runs, usr/bin + usr/share, and bin + share installs.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     for cand in [
         os.environ.get("ALLTAP_MAP", ""),          # 显式指定
+                                                   # explicit override
         os.path.join(here, "data", "dep-map.conf"), # 开发目录结构
+                                                    # source-tree layout
         os.path.join(here, "..", "..", "share", "alltap", "dep-map.conf"),   # usr/bin->usr/share 结构
+        # usr/bin -> usr/share layout
         os.path.join(here, "..", "share", "alltap", "dep-map.conf"),             # 单级 bin->share
+        # single-level bin -> share
         os.path.expanduser("~/.local/share/alltap/dep-map.conf"),
         "/usr/share/alltap/dep-map.conf",
         "/usr/local/share/alltap/dep-map.conf",
@@ -636,8 +805,8 @@ def find_map_file() -> str:
 
 # 内置兜底映射 (极小子集; data/dep-map.conf 更全)
 # 格式: 原名 => Arch名 (右值留空 = 丢弃); @regex 正则 => Arch名; @drop 名
-# 注意: 这里的 libgcc-s1 => gcc-libs 实际会被 DEB_TRASH 抢先丢掉
-# (translate() 先查 DEB_TRASH), 保留此行仅作文档说明.
+# built-in fallback map (minimal; data/dep-map.conf is richer)
+# syntax: name => arch-name (empty rhs = drop); @regex pattern => arch-name; @drop name
 EMBEDDED_MAP = r"""
 @regex ^lib(LLVM|clang)\d+.*$ => llvm-libs
 @regex ^(lib)?icu\d+$ => icu
@@ -690,6 +859,16 @@ def load_rules(path: str):
 
     返回: plain={原名: 新名或""}, regexes=[(编译后正则, 新名或"")], drops={名}
     注意 plain 与 drops 分开存放, 查询时 _lookup 先看 plain 再回退 drops.
+
+    Parse the mapping table into (plain, regexes, drops).
+
+    Syntax:
+      'name => arch-name'          exact mapping; empty rhs means drop
+      '@regex pattern => arch-name' regex mapping (re.match, i.e. anchored at start)
+      '@drop name [name...]'        explicit drop list
+      '#' starts a comment; blank lines ignored
+
+    plain and drops are kept separately; _lookup checks plain first, then drops.
     """
     plain, regexes, drops = {}, [], set()
     text = open(path, encoding="utf8").read() if path else EMBEDDED_MAP
@@ -723,6 +902,14 @@ def arch_repo_names() -> set:
     7 天过期是为了兼顾"新包能被识别"与"不频繁调用 pacman".
     pacman 不存在或执行失败时返回空集 — 此时 _lookup 只能靠映射表与启发式规则,
     未识别依赖会明显变多, 属于非 Arch 系统上运行时的预期行为.
+
+    All package names in the current official repositories (not AUR), cached in-process.
+
+    Two-level cache: memory (ARCH_REPOS_CACHE) and disk
+    (~/.cache/alltap/arch-repo-names.txt, 7 days). The disk cache avoids a slow
+    pacman -Slq on every start while still picking up new packages within a week.
+    Returns an empty set when pacman is missing or fails; then _lookup relies only
+    on mappings and heuristics, which is expected on non-Arch systems.
     """
     global ARCH_REPOS_CACHE
     if ARCH_REPOS_CACHE is not None:
@@ -757,6 +944,18 @@ class Translator:
 
     三个日志列表贯穿一次转换: translated/unresolved/droplog,
     后者用于退出前统一提示, 避免逐条刷屏.
+
+    Translator from source-distro dependency names to Arch package names.
+
+    Rule chain (see _lookup):
+      1. exact entries / drop list in the map
+      2. regex entries in the map
+      3. same name exists in the Arch repositories
+      4. library-name heuristics (strip soname version, -dev/-devel suffix, lib prefix)
+
+    Unresolved names go to ``unresolved`` and are kept or dropped according to
+    --keep-unknown-deps. The three lists (translated/unresolved/droplog) cover one
+    conversion and are reset per input file.
     """
 
     def __init__(self, opts):
@@ -771,33 +970,49 @@ class Translator:
         self.translated = []
 
     # ---- 规则链 ----
+    # ---- rule chain ----
     def _lookup(self, name: str) -> Optional[str]:
         """把单个源依赖名解析为 Arch 包名; 返回 None 表示"应丢弃/无法翻译".
 
         注意与 translate() 的分工: 本函数只做"名字 -> 名字"的纯映射,
         不记录日志、不决定未识别依赖的去留. 调用方 (translate) 才拥有策略权.
         返回空字符串与 None 语义相同 (映射表右值留空 = 丢弃).
+
+        Resolve one source dependency name to an Arch package name; None means
+        "drop / cannot translate".
+
+        Division of labor: this function is a pure name->name mapping and does not log
+        or decide the fate of unknown dependencies; translate() owns that policy.
+        An empty string and None have the same meaning (empty rhs in the map = drop).
         """
         # 1. 显式映射
+        # 1. explicit mapping
         if name in self.plain:
             return self.plain[name] or None    # 空值 = 丢弃
+                                               # empty value = drop
         if name in self.drops:
             return None
         # 2. 正则
+        # 2. regular expressions
         for rx, dest in self.regexes:
             if rx.match(name):
                 return dest or None
         # 3. 直接与 Arch 仓库同名
+        # 3. same name already exists in the Arch repositories
         if name in self.repo:
             return name
         # 4. lib 前缀/soname 后缀变形
+        # 4. lib-prefix / soname suffix transformations
         cands = []
         # 4a. libfoo1.2 / libfoo1.2-3 -> libfoo (去 soname 版本号)
+        # 4a. libfoo1.2 / libfoo1.2-3 -> libfoo (strip soname version)
         m = re.match(r"^(lib[^-]+?)[0-9]+([.][0-9.]+)?([-+].*)?$", name)
         if m:
             base = m.group(1)
             cands += [base]
         # 4b. 去 -dev/-devel/-doc/-common/-bin 后缀; -dev/-devel 额外尝试带 lib 前缀形式
+        # 4b. strip -dev/-devel/-doc/-common/-bin suffixes; for -dev/-devel also try the
+        # lib-prefixed form
         m2 = re.match(r"^(lib)?(.+?)(-dev|-devel|-doc|-docs|-common|-bin)?$", name)
         if m2:
             core = m2.group(2)
@@ -812,12 +1027,14 @@ class Translator:
             cands = [lib, lib[3:] if lib.startswith("lib") else lib] + cands
         for c in cands:
             if not c or len(c) <= 2:       # 过短的候选名极易误匹配, 直接跳过
+                                           # very short candidates match too easily; skip them
                 continue
             if c in self.plain:
                 return self.plain[c] or None
             if c in self.repo:
                 return c
             # 再试 去 lib
+            # try again with the lib prefix removed
             if c.startswith("lib") and len(c) > 5:
                 c2 = c[3:]
                 if c2 in self.plain:
@@ -834,6 +1051,16 @@ class Translator:
 
         顺序上的一个细节: drops (映射表显式丢弃) 先于 DEB_TRASH 判断,
         所以映射表里的 @drop 能覆盖代码内置的垃圾名单.
+
+        Translate one dependency; unresolved ones are kept or dropped according to
+        --keep-unknown-deps.
+
+        ctx is the source format (deb/rpm/apk...), currently used only for the
+        deb-specific infrastructure drop set. None means "caller should drop it";
+        a Dep means usable (possibly kept under its original name).
+
+        Ordering detail: drops (explicit @drop in the map) are checked before
+        DEB_TRASH, so map-level drops override the built-in list.
         """
         name = dep.name
         if name in self.drops:
@@ -852,11 +1079,18 @@ class Translator:
             return nd
         # 去留由 opts.keep_unknown_deps 决定, 记录里只保留原始依赖名,
         # 避免输出与报告出现 "(保留原样)" 之类的重复注解
+        # whether to keep unknown deps is decided by opts.keep_unknown_deps; the log keeps only the
+        # original name,
+        # avoid duplicate annotations such as "(kept as-is)" in output and reports
         self.unresolved.append(name)
         return dep if self.opts.keep_unknown_deps else None
 
     def reset(self):
-        """清空三份日志 — 必须在处理每个新输入文件前调用, 否则报告串包."""
+        """清空三份日志 — 必须在处理每个新输入文件前调用, 否则报告串包.
+
+        Clear the three logs — must be called before each new input file, otherwise
+        reports bleed across packages.
+        """
         self.unresolved = []
         self.droplog = []
         self.translated = []
@@ -866,23 +1100,31 @@ class Translator:
 # RPM 的 Requires 里混有大量非包名条目: rpmlib(...) 是 rpm 自身能力,
 # config(...) 是配置文件能力, /bin/sh 这类绝对路径依赖, 以及 soname 依赖.
 # Arch 用包名而不是 soname 追踪依赖, 因此 soname 一律丢弃 (否则会造出假依赖).
+# garbage lists for each source format
+# RPM Requires contains many non-package entries: rpmlib(...) is an rpm capability,
+# config(...) is a config-file capability, /bin/sh is an absolute-path dependency, plus soname
+# dependencies.
+# Arch tracks dependencies by package name, not soname, so sonames are always dropped (otherwise
+# they become bogus deps).
 RPM_GARBAGE = [
     re.compile(r"^rpmlib\(.*"), re.compile(r"^rtld\([^)]*\)$"),
     re.compile(r"^config\([^)]*\)$"), re.compile(r"^/.*"),           # /bin/sh 等
+    # such as /bin/sh
     re.compile(r".*\.so(\.[0-9]+)*(\([^)]*\))*$"),       # soname 含 GLIBC 版本标记/64bit
+    # soname contains GLIBC version markers / 64bit
     re.compile(r"^objfmt\("), re.compile(r"^elf\("),
     re.compile(r"^python\(abi\)"), re.compile(r"^perl\("), re.compile(r"^ruby\("),
     re.compile(r"^bundled\("), re.compile(r"^debuginfod\("),
     re.compile(r"^[A-Za-z0-9._+-]+\((x86-64|x86|aarch64|i686|ppc64le|s390x|riscv64)\)$"),  # 架构虚拟 provides
+    # architecture virtual provides
 ]
 
 DEB_TRASH = {  # 这些是发行版基础设施包, Arch 无对应概念, deb 特有丢弃集
-    # 注意: libgcc-s1 等同时出现在 EMBEDDED_MAP, 但 translate() 先查本集合,
-    # 所以实际行为是"丢弃"而非"映射到 gcc-libs" — 若改为映射需从本集合删掉.
+               # these are distro infrastructure packages with no Arch counterpart; deb-specific drop set
     "debconf", "debconf-2.0", "dpkg", "install-info", "libc-bin", "init-system-helpers",
     "base-files", "adduser", "usr-is-merged", "coreutils", "bash", "dash", "mount",
     "passwd", "passwd:", "libsasl2-modules", "systemd-sysv", "sysvinit-utils",
-    "lsb-base", "libgcc-12-base", "libgcc-s1", "gcc-12-base", "gcc-13-base",
+    "lsb-base", "libgcc-12-base", "gcc-12-base", "gcc-13-base",
     "ucf", "mime-support", "media-types", "x11-common", "shared-mime-info",
 }
 
@@ -892,6 +1134,7 @@ APK_TRASH_RE = [
 
 # ---------------------------------------------------------------------------
 # 各格式 handler: 返回 (Metadata, tree_dir, workdir)
+# per-format handlers: return (Metadata, tree_dir, workdir)
 # ---------------------------------------------------------------------------
 
 def pkg_deb(path: str, opts) -> Tuple[Metadata, str, str]:
@@ -904,6 +1147,14 @@ def pkg_deb(path: str, opts) -> Tuple[Metadata, str, str]:
     流程: ar 解出两个 tar -> bsdtar 各自解包 -> 读 control 填 Metadata ->
     把 dpkg 的维护脚本翻译成 .INSTALL 函数 (用 `set -- <dpkg参数>` 模拟 $1).
     返回 (Metadata, 文件树目录, 临时工作目录).
+
+    Parse a Debian package (.deb).
+
+    A .deb is an ar archive with members: debian-binary, control.tar.{gz,xz,zst}
+    (control, md5sums, conffiles, preinst...) and data.tar.{gz,xz,zst}.
+    Flow: ar -> two tars -> bsdtar extract -> read control into Metadata ->
+    translate dpkg maintainer scripts into .INSTALL functions (using
+    ``set -- <dpkg arg>`` to emulate $1). Returns (Metadata, file tree, temp dir).
     """
     members = parse_ar(path)
     ctrl_name = next((n for n, _ in members if n.startswith("control.tar.")), None)
@@ -915,6 +1166,8 @@ def pkg_deb(path: str, opts) -> Tuple[Metadata, str, str]:
     ctrl_arch = os.path.join(work, "control.tar")
     data_arch = os.path.join(work, "data.tar")
     # 先落盘成独立 tar, 交给 bsdtar 处理压缩格式差异 (gz/xz/zst 自动识别)
+    # write each member to a standalone tar first; bsdtar then handles the compression differences
+    # (gz/xz/zst auto-detected)
     open(ctrl_arch, "wb").write(dict(members)[ctrl_name])
     open(data_arch, "wb").write(dict(members)[data_name])
 
@@ -948,11 +1201,15 @@ def pkg_deb(path: str, opts) -> Tuple[Metadata, str, str]:
     # Depends / Pre-Depends → depends
     # deb 的 "a | b" 是"或"关系: 依次尝试翻译, 采用第一个能识别的结果;
     # 若全部失败且开启了 -k, 则保留第一个原始备选名.
+    # Depends / Pre-Depends -> depends
+    # deb's "a | b" means OR: try the alternatives in order and take the first translatable one;
+    # if all fail and -k is enabled, keep the first original alternative.
     for key in ("Depends", "Pre-Depends"):
         groups = parse_deb_dep_string(fields.get(key, ""))
         for alts in groups:
             chosen = None
             for a in alts:                # alternative 取第一个能翻译成功的
+                                          # alternative: take the first one that translates successfully
                 nd = tr.translate(a, "deb")
                 if nd:
                     chosen = nd
@@ -965,6 +1222,9 @@ def pkg_deb(path: str, opts) -> Tuple[Metadata, str, str]:
     # Recommends → optdepends
     # deb 的 Recommends 是弱依赖, 对应 Arch 的 optdepends;
     # 同样只取第一个备选 (pacman 的 optdepends 不支持"或"语法).
+    # Recommends -> optdepends
+    # deb Recommends is a weak dependency and maps to Arch optdepends;
+    # likewise only the first alternative is taken (pacman optdepends has no OR syntax).
     for alts in parse_deb_dep_string(fields.get("Recommends", "")):
         if not alts:
             continue
@@ -973,6 +1233,10 @@ def pkg_deb(path: str, opts) -> Tuple[Metadata, str, str]:
 
     # Provides / Conflicts / Breaks / Replaces (未识别的保留原名, 不计入依赖报告)
     # 这些字段不是"安装依赖", 用 _lookup 而非 translate(), 避免污染依赖报告.
+    # Provides / Conflicts / Breaks / Replaces (unknown names kept as-is; not counted in the
+    # dependency report)
+    # these fields are not install dependencies; use _lookup instead of translate() to keep the
+    # dependency report clean.
     for alts in parse_deb_dep_string(fields.get("Provides", "")):
         d = alts[0]
         nm = tr._lookup(d.name) or d.name
@@ -991,6 +1255,13 @@ def pkg_deb(path: str, opts) -> Tuple[Metadata, str, str]:
     # $1=1(安装) / 2(升级) / 0(卸载). 用 `set -- <值>` 预置位置参数,
     # 让原脚本里 `case "$1" in configure)` 这类判断尽量能跑通 — 属近似翻译.
     # 局限: prerm/postrm 在升级场景也会被 dpkg 调用, 此处只映射到 *_remove.
+    # maintenance scripts -> .INSTALL (simulating deb argument semantics)
+    # dpkg passes $1 (install/upgrade/remove/configure) to scripts, while pacman passes
+    # $1=1 (install) / 2 (upgrade) / 0 (remove). `set -- <value>` pre-seeds the positional
+    # parameters,
+    # so that checks like `case "$1" in configure)` in the original script still work — an
+    # approximation.
+    # limitation: dpkg also calls prerm/postrm on upgrades, but here they only map to *_remove.
     script_map = {
         "preinst":  [("pre_install", "install"), ("pre_upgrade", "upgrade")],
         "postinst": [("post_install", "configure"), ("post_upgrade", "configure")],
@@ -1019,21 +1290,36 @@ MAP_ARCH = {
     # alpine
     "x86": "i686", "armv7": "armv7h", "armhf_musl": "armv7h",
     # slack
-    "ia64": "i686",
+    # ia64 (Itanium) 在 Arch 没有对应架构, 不做臆测映射, 留给 map_arch 告警
+    # ia64 (Itanium) has no Arch counterpart; do not guess a mapping, let map_arch warn
 }
+
+# Arch 侧认可的架构集合 = 映射值 ∪ {any}
+# architectures accepted by Arch = mapped values ∪ {any}
+KNOWN_ARCH = set(MAP_ARCH.values()) | {"any"}
 
 
 def map_arch(a: str, src: str) -> str:
     """把源发行版架构名映射到 Arch 架构名.
 
-    未知架构当前会静默回退到 x86_64 (而非 any), 这是为了让"名字没收录但
-    确实是二进制包"的场景仍能产出可安装包; 代价是 arch 可能不准, 需肉眼确认.
-    src 参数目前未参与判定, 保留为后续按格式细分映射的入口.
+    未知架构会告警并回退到 x86_64 (而不是静默仿造一个不存在的架构);
+    需要时可用 -a 显式覆盖. src 参数保留为后续按格式细分映射的入口.
+
+    Map a source-distro architecture name to an Arch architecture name.
+
+    Unknown architectures trigger a warning and fall back to x86_64 (rather than
+    silently inventing an unsupported arch); override with -a. The src parameter
+    is reserved for future per-format refinements.
     """
     a = a.strip().lower()
     if not a:
         return "any"
-    return MAP_ARCH.get(a, a if a in ("x86_64", "i686", "aarch64", "any", "armv7h", "riscv64", "arm", "loongarch64") else "x86_64")
+    if a in MAP_ARCH:
+        return MAP_ARCH[a]
+    if a in KNOWN_ARCH:
+        return a
+    log.warn(f"未知架构 {a!r}, 按 x86_64 处理 (可用 -a 覆盖)")
+    return "x86_64"
 
 
 def split_deb_version(v: str):
@@ -1044,6 +1330,12 @@ def split_deb_version(v: str):
     '~' 是 deb 的预发布标记 (排序低于空串), pacman 不认, 统一换成 '_';
     '+' 同样不在 pkgrel 允许字符内. 注意这里只做字符集清洗, 真正的
     pkgrel 规范化由 sanitize_rel 完成.
+
+    Split "[epoch:]version[-revision]" -> (epoch, version, revision).
+
+    Split on the last '-' (the revision is last per deb policy); default revision
+    is "1". '~' is deb's pre-release marker and '+' is not allowed in pkgrel, so
+    both are replaced; sanitize_rel performs the final pkgrel normalization.
     """
     v = v.strip()
     epoch = ""
@@ -1060,6 +1352,7 @@ def split_deb_version(v: str):
 
 
 # deb 的比较符与 pacman 基本一一对应, 只有 << / >> 需换成 < / >
+# deb comparison operators map almost one-to-one to pacman; only << / >> become < / >
 DEB_OP = {"<<": "<", "<=": "<=", "=": "=", ">=": ">=", ">>": ">", ">": ">", "<": "<"}
 
 
@@ -1069,6 +1362,13 @@ def parse_deb_dep_string(s: str):
     语法: 逗号分隔组, 组内 '|' 分隔备选, 每项可带架构限定 ':any/:native'
     与版本约束 '(>= 1.2)'. 正则未做全串匹配, 未识别的尾部细节会被忽略.
     返回的是"组"的列表而不是扁平列表, 因为 'a | b' 的选择逻辑需要知道分组.
+
+    Parse a deb dependency field -> [[Dep, ...] (alternatives in one group), ...].
+
+    Syntax: comma-separated groups, '|' separates alternatives, each item may carry
+    an architecture qualifier (:any/:native) and a version constraint (>= 1.2).
+    The regex is not anchored at the end, so unrecognized trailing details are
+    ignored. Groups are preserved because 'a | b' selection needs them.
     """
     out = []
     if not s:
@@ -1100,6 +1400,11 @@ def find_script(d: str, sname: str):
 
     control.tar 成员名在不同打包器下可能是 './postinst'、'postinst' 或
     'control/postinst', 因此用后缀匹配而不是精确路径. 找不到返回 None.
+
+    Find a maintainer script in the control directory (allowing './' or subdirs).
+
+    Member names vary between packers: './postinst', 'postinst' or
+    'control/postinst'. Suffix matching handles all of them; returns None if absent.
     """
     for root, _, files in os.walk(d):
         for fn in files:
@@ -1115,6 +1420,12 @@ def read_script(path: str, strip_shebang=True):
     为什么要去 shebang: .INSTALL 里的函数体由 pacman 用 /bin/bash 执行,
     原脚本的 '#!/bin/sh' 会被当成普通注释/命令行, 保留反而可能误导.
     读失败返回 None (调用方跳过该脚本), 不抛异常以免中断整个转换.
+
+    Read a maintainer script body; the shebang line is removed by default.
+
+    Why: .INSTALL functions are executed by pacman with /bin/bash, and the original
+    '#!/bin/sh' would just be a misleading comment/command. Returns None on read
+    failure so the caller can skip that script instead of aborting the conversion.
     """
     try:
         txt = open(path, encoding="utf8", errors="replace").read()
@@ -1131,6 +1442,12 @@ def rpm_dep_triplet(rpm: RpmInfo, ntag, ftag, vtag):
 
     rpm header 里依赖是三个等长数组, 按 index 对应; 某数组短时用默认值补齐
     (flags=0 表示无约束, ver=""), 避免畸形包直接抛 IndexError.
+
+    Flatten rpm's three parallel arrays (names/flags/versions) into
+    [(name, flags, ver), ...].
+
+    Missing array elements use defaults (flags=0 means unversioned, ver="") to avoid
+    IndexError on malformed packages.
     """
     names = rpm.f.get(T[ntag], []) or []
     flags = rpm.f.get(T[ftag], []) or []
@@ -1156,6 +1473,20 @@ def pkg_rpm(path: str, opts) -> Tuple[Metadata, str, str]:
       * 真正剩下的包名走 Translator 翻译, 失败时由 -k 策略决定去留.
     脚本部分只处理 prein/postin/preun/postun; pre/posttrans 在 pacman 中
     没有对应钩子, 仅提醒用户.
+
+    Parse an RPM package -> (Metadata, file tree, temp dir).
+
+    RPM tag types vary (STRING / STRING_ARRAY / I18NSTRING / INT32) and the same tag
+    may be a str or a list depending on the package, so EPOCH/SUMMARY/DESCRIPTION
+    are normalized at read time.
+
+    Dependency policy:
+      * virtual capabilities and sonames in Requires are dropped (RPM_GARBAGE),
+        because Arch tracks package names, not sonames;
+      * remaining package names go through Translator; -k decides the fate of
+        unresolved ones.
+    Scriptlets handle prein/postin/preun/postun only; pre/posttrans have no pacman
+    hook and are reported to the user.
     """
     try:
         rpm = parse_rpm(path)
@@ -1190,6 +1521,9 @@ def pkg_rpm(path: str, opts) -> Tuple[Metadata, str, str]:
     # LICENSE 可能是 "MIT AND GPL-2.0-or-later" 这类复合表达式:
     # 按 AND/OR 拆开逐项归一化, 去重后重新拼成空格分隔的列表
     # (write_pkginfo 会再拆成多行 license = ...).
+    # LICENSE may be a compound expression such as "MIT AND GPL-2.0-or-later":
+    # split on AND/OR, normalize each item, deduplicate, then join with spaces
+    # (write_pkginfo splits it again into multiple license = lines).
     lic_raw = rpm.f.get(T["LICENSE"], "") or "unknown"
     parts = [p.strip() for p in re.split(r"\s+(?:AND|OR|and|or)\s+", lic_raw) if p.strip() and p.strip() not in ("(", ")", "AND", "OR")]
     lic_out = []
@@ -1203,6 +1537,8 @@ def pkg_rpm(path: str, opts) -> Tuple[Metadata, str, str]:
 
     # Requires
     # 先过滤虚拟能力/soname (见 RPM_GARBAGE), 剩下的才是真正的包名依赖.
+    # filter out virtual capabilities/sonames first (see RPM_GARBAGE); what remains are real package
+    # dependencies.
     for nm, fl, vv in rpm_dep_triplet(rpm, "REQUIRENAME", "REQUIREFLAGS", "REQUIREVERSION"):
         if is_rpm_virtual(nm):
             log.verb(f"丢弃 RPM 虚拟/soname 依赖: {nm}")
@@ -1214,11 +1550,13 @@ def pkg_rpm(path: str, opts) -> Tuple[Metadata, str, str]:
             meta.depends.append(nd)
 
     # Recommends (weak) → optdepends
+    # Recommends (weak) -> optdepends
     for nm, fl, vv in rpm_dep_triplet(rpm, "RECOMMENDNAME", "RECOMMENDFLAGS", "RECOMMENDVERSION"):
         if not is_rpm_virtual(nm):
             meta.optdepends.append(f"{nm}: (由 Recommends 转换, 可选)")
 
     # Provides (未识别保留原名, 不计入依赖报告)
+    # Provides (unknown names are kept as-is; not counted in the dependency report)
     for nm, fl, vv in rpm_dep_triplet(rpm, "PROVIDENAME", "PROVIDEFLAGS", "PROVIDEVERSION"):
         if is_rpm_virtual(nm):
             continue
@@ -1239,6 +1577,9 @@ def pkg_rpm(path: str, opts) -> Tuple[Metadata, str, str]:
     # RPM 的 scriptlet 通过 POSTINPROG 声明解释器; 若解释器是 ldconfig,
     # 说明该包需要刷新动态链接器缓存 — 这在 Arch 上同样必须做.
     # pacman 不调用 ldconfig, 因此需要手动追加到 post_install/post_upgrade.
+    # RPM scriptlets declare their interpreter via POSTINPROG; if the interpreter is ldconfig,
+    # it means the package needs the dynamic linker cache refreshed — also required on Arch.
+    # pacman does not call ldconfig, so it must be appended manually to post_install/post_upgrade.
     if not opts.no_scripts:
         prog = rpm.f.get(T["POSTINPROG"], "")
         ldconfig = False
@@ -1276,7 +1617,11 @@ def pkg_rpm(path: str, opts) -> Tuple[Metadata, str, str]:
 
 
 def is_rpm_virtual(nm: str) -> bool:
-    """判断是否是 rpm 虚拟能力/soname/路径类依赖 (不应出现在 Arch depends 中)."""
+    """判断是否是 rpm 虚拟能力/soname/路径类依赖 (不应出现在 Arch depends 中).
+
+    Return True for rpm virtual capabilities/sonames/path dependencies that must
+    not appear in Arch depends.
+    """
     for rx in RPM_GARBAGE:
         if rx.match(nm):
             return True
@@ -1289,13 +1634,21 @@ def sanitize_license(l: str) -> str:
     分三步: 查别名表 -> 过长 (>24 字符) 且无别名则标 custom
     -> 否则剔除非 [A-Za-z0-9.+-] 字符. 返回单token字符串,
     多许可证的合并由调用方 (pkg_rpm) 负责.
+
+    Normalize a source-distro license string to a common Arch short name.
+
+    Three steps: alias table -> strings longer than 24 chars without an alias become
+    "custom" -> otherwise strip characters outside [A-Za-z0-9.+-]. Returns a single
+    token; pkg_rpm merges multiple licenses.
     """
     l = l.strip()
     if not l:
         return "unknown"
     # 常见别名归并
+    # merge common license aliases
     aliases = {
         # 传统写法
+        # traditional spelling
         "GPLv2": "GPL2", "GPLv2+": "GPL", "GPLv3": "GPL3", "GPLv3+": "GPL",
         "GPL": "GPL", "LGPLv2": "LGPL", "LGPLv2+": "LGPL",
         "LGPLv3": "LGPL", "MIT": "MIT", "BSD": "BSD", "BSD-2-Clause": "BSD",
@@ -1303,6 +1656,7 @@ def sanitize_license(l: str) -> str:
         "ISC": "ISC", "MPLv1.1": "MPL", "MPLv2.0": "MPL", "Python": "Python",
         "Public Domain": "public-domain", "unknown": "unknown",
         # SPDX 写法 (新 rpm/Fedora 默认)
+        # SPDX style (default in newer rpm/Fedora)
         "GPL-2.0-only": "GPL2", "GPL-2.0-or-later": "GPL",
         "GPL-2.0-or-newer": "GPL", "GPL-2+": "GPL",
         "GPL-3.0-only": "GPL3", "GPL-3.0-or-later": "GPL",
@@ -1328,6 +1682,11 @@ def parse_pkginfo_kv(text: str):
 
     与 deb control 类似但更宽松: 同名 key 后者覆盖前者 (apk 里 depends 可能
     出现多行同名, 但实际 abuild 会把它们合并到一行空格分隔).
+
+    Parse .PKGINFO / abuild "key = value" format, including indented continuation lines.
+
+    Similar to deb control but looser: a repeated key overwrites the previous value
+    (abuild normally merges multi-value fields into one space-separated line).
     """
     kv = {}
     last = None
@@ -1352,13 +1711,25 @@ def pkg_apk(path: str, opts) -> Tuple[Metadata, str, str]:
 
     已知局限: 不支持 apk v3 (ADB 格式); '~' 在 apk 里是"同主版本及以上的模糊匹配",
     这里按 '=' 处理 (偏严格, 可能导致升级时需手动确认).
+
+    Parse an Alpine apk (a gzip-compressed tar whose first member is .PKGINFO).
+
+    apk v2 layout: .SIGN.* / .PKGINFO / file tree / optional .pre-install etc.
+    Metadata files are removed from the tree at the end so they are never installed.
+
+    Dependency syntax: space-separated items with <,<=,=,>=,>,~ constraints; items
+    starting with so:/cmd: are virtual capabilities (like rpm sonames) and dropped.
+
+    Limitation: apk v3 (ADB format) is unsupported; apk's '~' means "same major
+    version or newer" but is treated as '=' here (stricter, may require manual
+    confirmation on upgrades).
     """
     work = tempfile.mkdtemp(prefix="alltap-apk-")
     fdir = os.path.join(work, "files")
-    meta_files = bsdtar_list(path)      # 目前未使用; 保留供将来按成员名做更精细的判别
     bsdtar_extract(path, fdir)
 
     # 读 .PKGINFO
+    # read .PKGINFO
     kv = {}
     pinfo = os.path.join(fdir, ".PKGINFO")
     if os.path.exists(pinfo):
@@ -1398,6 +1769,7 @@ def pkg_apk(path: str, opts) -> Tuple[Metadata, str, str]:
         meta.replaces.append(rn)
 
     # alpine 安装脚本 → pacman 语义一一对应 (最好移植的场景)
+    # Alpine install scripts map one-to-one onto pacman semantics (the easiest format to port)
     if not opts.no_scripts:
         pairs = {".pre-install": None, ".post-install": None, ".pre-upgrade": None,
                  ".post-upgrade": None, ".pre-deinstall": None, ".post-deinstall": None}
@@ -1413,6 +1785,7 @@ def pkg_apk(path: str, opts) -> Tuple[Metadata, str, str]:
                 meta.scripts[mapping[src]] = body
 
     # 从文件树剔除 meta 文件
+    # strip metadata files from the file tree
     for junk in (".PKGINFO", ".PKGINFO.new", ".SIGN.RSA.alpine-devel@lists.alpinelinux.org-4a6a0840.rsa.pub",
                  ".trigger", ".apk-new", ".pre-install", ".post-install", ".pre-upgrade",
                  ".post-upgrade", ".pre-deinstall", ".post-deinstall",
@@ -1425,6 +1798,7 @@ def pkg_apk(path: str, opts) -> Tuple[Metadata, str, str]:
         if os.path.isdir(p):
             shutil.rmtree(p)
     # 通配 .SIGN.*
+    # wildcard .SIGN.*
     for name in list(os.listdir(fdir)):
         if name.startswith(".SIGN."):
             p = os.path.join(fdir, name)
@@ -1436,6 +1810,11 @@ def split_apk_version(v: str):
     """拆 apk 的 "[epoch:]pkgver-r<pkgrel>" -> (epoch, version, release).
 
     无 -rN 后缀时 pkgrel 给 "0" — apk 世界里 0 是合法的初始 release.
+
+    Split apk's "[epoch:]pkgver-r<pkgrel>" -> (epoch, version, release).
+
+    Without -rN the release defaults to "0", which is a valid initial release in the
+    apk world.
     """
     v = v.strip()
     epoch = ""
@@ -1458,6 +1837,17 @@ def pkg_slack(path: str, opts) -> Tuple[Metadata, str, str]:
       * install/doinst.sh 是安装后脚本, 对应 pacman 的 post_install/post_upgrade;
       * install/ 目录本身不是包内容, 必须剔除.
     不支持 .tar.lz/.tar.zst 等非标准后缀 (Slackware 官方只用 tgz/txz).
+
+    Parse a Slackware package (name-version-arch-build.txz naming convention).
+
+    Slackware packages have no standalone metadata file; information comes from the
+    filename and install/slack-desc:
+      * filename has four fields: name-version-arch-build;
+      * install/slack-desc uses "|icon|pkgname: description"; the first text line is
+        the short description, following non-empty lines form the long description;
+      * install/doinst.sh is a post-install script -> post_install/post_upgrade;
+      * the install/ directory itself is metadata and must be removed.
+    Non-standard suffixes such as .tar.lz/.tar.zst are unsupported.
     """
     base = os.path.basename(path)
     m = re.match(r"^(.+)-([^-]+)-([^-]+)-(\d+)(?:\.txz|\.tgz|\.tar\.xz|\.tar\.gz)$", base, re.I)
@@ -1494,9 +1884,11 @@ def pkg_slack(path: str, opts) -> Tuple[Metadata, str, str]:
         meta.desc = f"(Slackware 包 {name})"
 
     # install/ 目录剔除
+    # drop the install/ directory
     idir = os.path.join(fdir, "install")
     if os.path.isdir(idir):
         # doinst.sh 仅记录说明
+        # doinst.sh is only noted (its body is ported to post_install)
         doinst = os.path.join(idir, "doinst.sh")
         if os.path.exists(doinst) and not opts.no_scripts:
             body = read_script(doinst)
@@ -1519,6 +1911,19 @@ def pkg_appimage(path: str, opts) -> Tuple[Metadata, str, str]:
     名称/版本推断: 去掉 .AppImage 后缀, 再尝试拆出结尾的 -v1.2.3 / -1.2.3;
     均可用 -n/-v 覆盖. 架构从 ELF header 的 e_ident[EI_CLASS] + e_machine 判定.
     局限: 不解包 squashfs, 因此拿不到 .desktop/图标与 AppImage 内部元数据.
+
+    Repackage an AppImage: place the whole .AppImage under <prefix>/<name>/ and
+    link it from /usr/bin.
+
+    An AppImage is a self-mounting ELF + squashfs. Installing it as a plain ELF in
+    /usr/bin would work but loses desktop/icon context; keeping the original file
+    and exposing a symlink preserves AppImage's own verification/update behavior and
+    makes uninstalling a single directory removal.
+
+    Name/version inference: strip .AppImage, then try to split a trailing
+    -v1.2.3 / -1.2.3; both can be overridden with -n/-v. Architecture is read from
+    the ELF header. Limitation: squashfs is not unpacked, so .desktop/icons and
+    internal AppImage metadata are unavailable.
     """
     base = os.path.basename(path)
     raw = base[:-len(".AppImage")] if base.lower().endswith(".appimage") else base
@@ -1544,6 +1949,10 @@ def pkg_appimage(path: str, opts) -> Tuple[Metadata, str, str]:
     # 从 ELF 判架构
     # e_ident[4]: 1=32 位, 2=64 位; e_machine 在偏移 18 (小端 uint16).
     # 只识别四种常见目标; 其余保持 x86_64 默认值 (可用 -a 覆盖).
+    # detect architecture from the ELF header
+    # e_ident[4]: 1=32-bit, 2=64-bit; e_machine lives at offset 18 (little-endian uint16).
+    # only four common targets are recognized; everything else keeps the x86_64 default (override
+    # with -a).
     arch = "x86_64"
     try:
         with open(path, "rb") as f:
@@ -1573,6 +1982,7 @@ def pkg_appimage(path: str, opts) -> Tuple[Metadata, str, str]:
     return meta, fdir, work
 
 # ---- 通用归档 ----------------------------------------------------------------
+# ---- generic archive -----------------------------------------------------
 
 def pkg_tarball(path: str, opts) -> Tuple[Metadata, str, str]:
     """处理普通归档 (.tar.gz/.xz/.zst/.tgz...), 两种布局策略:
@@ -1584,25 +1994,44 @@ def pkg_tarball(path: str, opts) -> Tuple[Metadata, str, str]:
 
     名称/版本推断优先级: -n/-v 命令行 > 单顶层目录名拆解 > 归档文件名.
 
-    已知局限: 若单顶层目录本身就是系统目录 (如直接用 `tar -cf pkg.tar usr`),
-    会把 usr 当成"包装目录"剥掉, 导致 /usr/bin 变成 /bin (待确认后修复).
+    顶层目录本身是系统目录时 (如直接用 `tar -cf pkg.tar usr`) 不会被当成
+    包装层剥掉, 否则 /usr/bin 会错误地变成 /bin.
+
+    Handle a generic archive (.tar.gz/.xz/.zst/.tgz...), with two layout strategies:
+
+    A. contains a system tree (usr/ etc/ lib/ bin/ ...) -> use it as the package
+       root, optionally stripping one wrapper directory; suitable for release
+       tarballs like "myapp-1.0/usr/bin/myapp".
+    B. no system tree -> move everything under <prefix>/<pkgname> (default
+       /opt/<pkgname>) instead of scattering files into /usr or /.
+
+    Name/version priority: -n/-v > single top-level directory name > archive name.
+
+    If the single top-level directory is itself a system directory (e.g. a tarball
+    made with `tar -cf pkg.tar usr`), it is NOT treated as a wrapper; otherwise
+    /usr/bin would incorrectly become /bin.
     """
     names = bsdtar_list(path)
     tops = sorted({n.split("/")[0] for n in names if "/" in n and n.split("/")[0] not in (".", "..")})
     single_top = tops[0] if len(tops) == 1 else None
     sys_dirs = {"usr", "etc", "lib", "lib32", "lib64", "bin", "sbin", "opt", "var"}
-    prefix = (single_top + "/") if single_top else ""
+    # 只有"非系统目录"的顶层才可能是发布包的包装层; 系统目录必须原样保留.
+    # only a top-level directory that is NOT a system directory can be a release wrapper; system
+    # directories must be preserved.
+    strip_top = single_top is not None and single_top not in sys_dirs
+    prefix = (single_top + "/") if strip_top else ""
 
     def rel(n):
-        """把成员路径里被推断出的"包装层"前缀剥掉."""
+        """把成员路径里被推断出的"包装层"前缀剥掉.
+
+        Strip the inferred "wrapper layer" prefix from a member path.
+        """
         return n[len(prefix):] if prefix and n.startswith(prefix) else n
 
     # 系统树判定: 允许归档带一层顶层目录 (如 myapp-9/usr/...)
+    # system-tree detection: allow one wrapper directory (e.g. myapp-9/usr/...)
     has_system = any(rel(n).split("/")[0] in sys_dirs for n in names if "/" in n)
     has_system = has_system or any(rel(n) in sys_dirs for n in names)
-    # 注意: 当 single_top 自身就在 sys_dirs 里时, rel() 会把 "usr/bin/x" 变成
-    # "bin/x", 使 has_system 误为真; 上方剥目录分支会错误地把 usr/ 剥掉.
-    # 正确做法应是: single_top in sys_dirs 时不剥前缀 (待确认后修复).
 
     work = tempfile.mkdtemp(prefix="alltap-tb-")
     fdir = os.path.join(work, "files")
@@ -1622,35 +2051,41 @@ def pkg_tarball(path: str, opts) -> Tuple[Metadata, str, str]:
     else:
         guess_name = os.path.basename(path).split(".")[0].lower()
 
-    if single_top and has_system:
-        # 系统树 + 单顶层: 剥掉顶层目录 (如 foo-1.0/usr/bin -> usr/bin)
+    if strip_top and has_system:
+        # 包装层 + 系统树: 剥掉包装层 (如 foo-1.0/usr/bin -> usr/bin)
+        # wrapper directory + system tree: strip the wrapper (e.g. foo-1.0/usr/bin -> usr/bin)
         sub = os.path.join(fdir, single_top)
         if os.path.isdir(sub):
             for item in os.listdir(sub):
                 shutil.move(os.path.join(sub, item), os.path.join(fdir, item))
             os.rmdir(sub)
     elif not has_system:
-        # 无系统树 → 统一装到 /opt/<pkgname>
+        # 无系统树 → 统一装到 <prefix>/<pkgname> (默认 /opt/<pkgname>)
+        # no system tree -> install under <prefix>/<pkgname> (default /opt/<pkgname>)
         pname = sanitize_pkgname(guess_name)
         pfx = (opts.prefix.format(pkgname=pname) if "{pkgname}" in opts.prefix
                else (opts.prefix.rstrip("/") + "/" + pname))
         tgt = os.path.join(fdir, pfx.lstrip("/"))
-        os.makedirs(tgt, exist_ok=True)
+        # 先搬到 fdir 之外的 stage, 再整体放入目标目录:
+        # 否则自定义 prefix (如 /usr/local/<pkg>) 会使目标位于待搬目录内部,
+        # shutil.move 报 "Cannot move a directory into itself".
+        # move into a stage outside fdir first, then move everything into the target directory:
+        # otherwise a custom prefix (e.g. /usr/local/<pkg>) puts the target inside a directory being
+        # moved,
+        # shutil.move reports "Cannot move a directory into itself".
+        stage = tempfile.mkdtemp(prefix="alltap-stage-", dir=work)
         if single_top:
             sub = os.path.join(fdir, single_top)
             for item in os.listdir(sub):
-                shutil.move(os.path.join(sub, item), os.path.join(tgt, item))
+                shutil.move(os.path.join(sub, item), os.path.join(stage, item))
             os.rmdir(sub)
         else:
-            # 无单顶层: 把所有顶层条目移进目标目录.
-            # 默认 prefix=/opt/<pkg> 时只需跳过 "opt" 自身;
-            # 若用户自定义 prefix (如 /usr/local/<pkg>), 目标目录位于某个待移
-            # 目录内部, 此处会递归搬移出错 — 已知局限, 需要时改为临时目录中转.
-            os.makedirs(os.path.join(fdir, "opt"), exist_ok=True)
             for item in os.listdir(fdir):
-                if item == "opt":
-                    continue
-                shutil.move(os.path.join(fdir, item), os.path.join(tgt, item))
+                shutil.move(os.path.join(fdir, item), os.path.join(stage, item))
+        os.makedirs(tgt, exist_ok=True)
+        for item in os.listdir(stage):
+            shutil.move(os.path.join(stage, item), os.path.join(tgt, item))
+        shutil.rmtree(stage, ignore_errors=True)
 
     meta.name = sanitize_pkgname(guess_name)
     e, v, r = split_deb_version(guess_ver)
@@ -1661,6 +2096,7 @@ def pkg_tarball(path: str, opts) -> Tuple[Metadata, str, str]:
     return meta, fdir, work
 
 # ---- Arch 包重打包 ------------------------------------------------------------
+# ---- Arch package repack --------------------------------------------------
 
 def pkg_archpkg(path: str, opts) -> Tuple[Metadata, str, str]:
     """重打包 Arch 包: 保留文件树, 重新生成 .PKGINFO/.MTREE, 可改元数据.
@@ -1669,6 +2105,14 @@ def pkg_archpkg(path: str, opts) -> Tuple[Metadata, str, str]:
     测试打包器自身. .INSTALL 以 __raw__ 形式原样保留; 其余打包元文件
     (.PKGINFO/.MTREE/.BUILDINFO/.CHANGELOG) 删除后由 build_pkg_file 重建.
     局限: 不保留 group/backup 等字段 (Metadata 未建模).
+
+    Repackage an Arch package: keep the file tree, regenerate .PKGINFO/.MTREE,
+    and optionally modify metadata.
+
+    Mainly used to correct metadata (rename, change dependencies/description), and
+    to test the packager itself. .INSTALL is preserved verbatim via __raw__; other
+    packaging files (.PKGINFO/.MTREE/.BUILDINFO/.CHANGELOG) are removed and rebuilt.
+    Limitation: fields not modeled by Metadata (backup, etc.) are not preserved.
     """
     work = tempfile.mkdtemp(prefix="alltap-pkg-")
     fdir = os.path.join(work, "files")
@@ -1680,6 +2124,7 @@ def pkg_archpkg(path: str, opts) -> Tuple[Metadata, str, str]:
     kv = parse_pkginfo_kv(text)
 
     # .PKGINFO 是 "key = value" 多行格式, 同一 key 可重复 (depend/license...)
+    # '.PKGINFO' is a multi-line "key = value" format; the same key may repeat (depend/license...)
     def get_lists(key):
         return re.findall(rf"^{re.escape(key)}\s*=\s*(.*)$", text, re.M)
 
@@ -1706,23 +2151,22 @@ def pkg_archpkg(path: str, opts) -> Tuple[Metadata, str, str]:
     for o in get_lists("optdepend"):
         meta.optdepends.append(o)
     for p in get_lists("provides"):
-        nm, op, ver = parse_pacman_dep(p)
         meta.provides.append(p)
     for c in get_lists("conflict"):
         meta.conflicts.append(c)
     for r in get_lists("replaces"):
         meta.replaces.append(r)
+    for g in get_lists("group"):
+        meta.groups.append(g)
 
-    # .INSTALL 保留
-    # 这段 re.findall 仅做"函数是否存在"的兼容检查, 结果未被使用 — 整体保留是
-    # 有意为之: 重写函数体会丢失原脚本的 shell 细节, 原样写回最安全.
+    # .INSTALL 整体原样保留: 重写函数体会丢失原脚本的 shell 细节
+    # keep .INSTALL verbatim: rewriting the functions would lose shell details of the original
+    # scripts
     inst = os.path.join(fdir, ".INSTALL")
     if os.path.exists(inst) and not opts.no_scripts:
-        body = open(inst, encoding="utf8", errors="replace").read()
-        for fn in re.findall(r"(?:post_install|pre_install|post_upgrade|pre_upgrade|pre_remove|post_remove)\s*\(\)\s*\{", body):
-            pass  # 简单起见整体保留在 .INSTALL 后续打包时原样写回
-        meta.scripts["__raw__"] = body
+        meta.scripts["__raw__"] = open(inst, encoding="utf8", errors="replace").read()
     # remove 元文件 (重打)
+    # remove metadata files (they are regenerated)
     for j in (".PKGINFO", ".MTREE", ".BUILDINFO", ".INSTALL", ".CHANGELOG", ".CHANGELOGS"):
         p = os.path.join(fdir, j)
         if os.path.exists(p):
@@ -1734,6 +2178,12 @@ def parse_pacman_dep(s: str):
     """拆分 pacman 依赖串 -> (name, op, ver); 无比较符时 op/ver 为 None.
 
     贪婪匹配 [?] 避免把包名里的 '-' 误当比较符 — 只看 <=>= 四个字符.
+
+    Split a pacman dependency string -> (name, op, ver); op/ver are None when
+    there is no comparison operator.
+
+    Only the four comparison characters are treated as operators, so '-' inside a
+    package name is never misparsed.
     """
     m = re.match(r"^([^<>=]+?)((<=|>=|=|<|>)(.*))?$", s.strip())
     if not m:
@@ -1742,6 +2192,7 @@ def parse_pacman_dep(s: str):
 
 # ---------------------------------------------------------------------------
 # 打包: .PKGINFO + .MTREE + .INSTALL → bsdtar → .pkg.tar.zst
+# packaging: .PKGINFO + .MTREE + .INSTALL -> bsdtar -> .pkg.tar.zst
 # ---------------------------------------------------------------------------
 
 def write_pkginfo(meta: Metadata, pkgroot: str, tree_size: int):
@@ -1753,6 +2204,14 @@ def write_pkginfo(meta: Metadata, pkgroot: str, tree_size: int):
         pacman 按行读取, 所以多值字段逐行追加;
       * pkgdesc 不能含换行 (多行会被解析器当成新字段), 统一压成单行;
       * size 单位为字节.
+
+    Generate .PKGINFO — the package metadata read by pacman.
+
+    Pitfalls:
+      * pkgver must contain the whole "[epoch:]version-pkgrel" string;
+      * the same key may repeat (license/depend/optdepend/provides...);
+      * pkgdesc must not contain newlines (they would start a new field);
+      * size is in bytes.
     """
     lines = [
         f"pkgname = {meta.name}",
@@ -1779,7 +2238,7 @@ def write_pkginfo(meta: Metadata, pkgroot: str, tree_size: int):
         lines.append(f"conflict = {c}")
     for r in meta.replaces:
         lines.append(f"replaces = {r}")
-    for grp in getattr(meta, "groups", []):
+    for grp in meta.groups:
         lines.append(f"group = {grp}")
     out = os.path.join(pkgroot, ".PKGINFO")
     with open(out, "w", encoding="utf8") as f:
@@ -1794,8 +2253,15 @@ def write_install(meta: Metadata, pkgroot: str):
       * __raw__: Arch 包重打包, 原文写回, 不做任何改写;
       * 移植脚本: 把各格式的维护脚本包装成 pacman 认识的六个钩子函数.
     返回写入路径; 没有任何脚本时返回 None (调用方据此决定是否把 .INSTALL 入包).
+
+    Generate .INSTALL (pacman install script).
+
+    Two sources: __raw__ (an Arch package repack, written back verbatim) or ported
+    scripts wrapped into the six pacman hooks. Returns the path, or None when there
+    are no scripts (the caller then omits .INSTALL from the package).
     """
     raw = meta.scripts.get("__raw__")   # 不清除, 支持修复循环中多次打包
+                                        # do not clear it: the repair loop may repackage several times
     if raw:
         body = raw
     else:
@@ -1818,6 +2284,11 @@ def tree_size_bytes(d: str) -> int:
 
     makepkg 用 `du -sk` 估算 (含目录项开销), 这里用 lstat 精确求和,
     两者会有小幅差异 — 但 .PKGINFO 的 size 只用于展示, 不影响安装.
+
+    Recursively sum the byte size of a file tree (regular files only, no directories).
+
+    makepkg estimates with `du -sk` (including directory overhead), so numbers may
+    differ slightly; .PKGINFO size is informational and does not affect installation.
     """
     total = 0
     for root, _, files in os.walk(d):
@@ -1841,10 +2312,24 @@ def build_pkg_file(meta: Metadata, tree_dir: str, outdir: str, workdir: str) -> 
     条目顺序: .PKGINFO, .MTREE, .INSTALL, 其余按字母序 — pacman 不要求顺序,
     但固定顺序能让同样输入的包字节级可重现 (除 builddate 外).
 
-    注意: zstd 使用默认压缩级别 (当前为 3), 而 makepkg 默认是
-    `zstd -c -T0 --ultra -20`; 所以本工具产物体积会略大, 但打包速度快很多.
-    另外管道两端都接 PIPE, 特大包且 bsdtar 向 stderr 大量输出时理论上可能死锁
-    (实际打包成功路径 stderr 几乎为空).
+    压缩级别用 -19 (makepkg 默认 --ultra -20, 两者体积接近; -19 明显更快).
+    bsdtar 的 stderr 写入临时文件而非 PIPE, 避免特大包输出过多时管道缓冲写满死锁.
+
+    Build a makepkg-style .pkg.tar.zst from a file tree + Metadata; returns the path.
+
+    Steps (mirroring makepkg's packaging phase):
+      1. copy the tree to pkgroot (copytree with symlinks=True);
+      2. write .PKGINFO / .INSTALL;
+      3. generate .MTREE with bsdtar (excluding .MTREE itself);
+      4. stream bsdtar into zstd.
+
+    Entry order: .PKGINFO, .MTREE, .INSTALL, then the rest alphabetically. pacman
+    does not require an order, but a fixed order makes output reproducible except
+    for builddate.
+
+    zstd level is -19 (makepkg defaults to --ultra -20; sizes are close and -19 is
+    much faster). bsdtar's stderr goes to a temp file instead of a pipe to avoid a
+    full-pipe deadlock on very large packages.
     """
     if not which("bsdtar") or not which("zstd"):
         die("打包需要 bsdtar 与 zstd: sudo pacman -S libarchive zstd")
@@ -1862,9 +2347,11 @@ def build_pkg_file(meta: Metadata, tree_dir: str, outdir: str, workdir: str) -> 
                      if e not in (".PKGINFO", ".MTREE", ".INSTALL"))
     ordered = [".PKGINFO", ".MTREE"] + ([".INSTALL"] if install_file else []) + entries
     # mtree 列表不含 .MTREE 自身 (尚未生成)
+    # the mtree list does not include .MTREE itself (not generated yet)
     mtree_list = [".PKGINFO"] + ([".INSTALL"] if install_file else []) + entries
 
     # 1) 生成 .MTREE (= makepkg 所做)
+    # 1) generate .MTREE (same as makepkg)
     mtree_cmd = ["bsdtar", "-cf", "-", "--format=mtree",
                  "--options=!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link",
                  "--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root"] + mtree_list
@@ -1873,16 +2360,25 @@ def build_pkg_file(meta: Metadata, tree_dir: str, outdir: str, workdir: str) -> 
         f.write(mtree)
 
     # 2) 打包 zstd
+    # 2) compress with zstd
     outpath = os.path.join(outdir, meta.pkgfilename)
     tar_cmd = ["bsdtar", "-cf", "-", "--format=gnutar",
                "--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root"] + ordered
-    p1 = subprocess.Popen(tar_cmd, cwd=pkgroot, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    p2 = subprocess.Popen(["zstd", "-q", "-T0", "-o", outpath, "-f"], stdin=p1.stdout,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    p1.stdout.close()
-    _, zerr = p2.communicate()
-    terr = p1.stderr.read().decode("utf8", "replace")
-    p1.wait()
+    err_path = os.path.join(workdir, "bsdtar.err")
+    with open(err_path, "w+b") as errf:
+        p1 = subprocess.Popen(tar_cmd, cwd=pkgroot, stdout=subprocess.PIPE, stderr=errf)
+        p2 = subprocess.Popen(["zstd", "-q", "-T0", "-19", "-o", outpath, "-f"],
+                              stdin=p1.stdout, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE)
+        p1.stdout.close()
+        _, zerr = p2.communicate()
+        p1.wait()
+        errf.seek(0)
+        terr = errf.read().decode("utf8", "replace")
+    try:
+        os.remove(err_path)
+    except OSError:
+        pass
     if p2.returncode != 0:
         raise RuntimeError("zstd 压缩失败: " + zerr.decode("utf8", "replace"))
     if p1.returncode != 0:
@@ -1891,28 +2387,43 @@ def build_pkg_file(meta: Metadata, tree_dir: str, outdir: str, workdir: str) -> 
 
 # ---------------------------------------------------------------------------
 # PKGBUILD 生成 (-p 模式)
+# PKGBUILD generation (-p mode)
 # ---------------------------------------------------------------------------
 
 def pkgbash_quote(s):
     """单引号转义, 用于把任意字符串安全嵌入 PKGBUILD 的 Bash 数组.
 
     ' -> '\\'' 是 POSIX shell 的标准写法 (结束单引号 + 转义单引号 + 重开).
+
+    Single-quote escaping so arbitrary strings can be embedded safely in a
+    PKGBUILD Bash array.
+
+    ' -> '\'' is the POSIX shell idiom (close quote, escaped quote, reopen).
     """
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def render_pkgbuild(meta: Metadata, src_file: str, src_format: str, outdir: str) -> str:
+def render_pkgbuild(meta: Metadata, src_file: str, src_format: str, outdir: str,
+                    opts=None) -> str:
     """生成 PKGBUILD (debtap 兼容的 -p 模式).
 
     思路: 把原包当成本地 source (noextract 阻止 makepkg 自动解压),
     在 package() 里按格式选择对应的解包命令, 把内容直接展到 $pkgdir.
 
-    已知局限 (待确认后修复):
-      * epoch 被拼进了 pkgver, 但 PKGBUILD 规范要求单独的 epoch= 变量,
-        makepkg 遇到 pkgver 中的 ':' 会报错;
-      * license 未按空格拆分, 多许可证会变成一个带空格的数组元素;
-      * 未加 options=(!strip), 预编译二进制可能被 makepkg 的 strip 破坏;
-      * appimage 分支写死 /opt, 忽略 --prefix.
+    epoch 按 PKGBUILD 规范写成独立变量 (pkgver 中出现 ':' 会被 makepkg 拒绝);
+    license 按空格拆成数组; 统一加 options=(!strip !debug), 防止预编译二进制被
+    makepkg 的 strip/debug 流程破坏; AppImage 安装路径跟随 --prefix.
+
+    Generate a PKGBUILD (debtap-compatible -p mode).
+
+    The original package is a local source (noextract prevents makepkg from
+    extracting it); package() selects the right unpack command per format and
+    expands the content into $pkgdir.
+
+    epoch is written as a separate variable (makepkg rejects ':' in pkgver);
+    license is split on spaces into the array; options=(!strip !debug) prevents
+    makepkg from stripping or generating debug info for prebuilt binaries; the
+    AppImage install path follows --prefix.
     """
     deps = [pkgbash_quote(d.to_pacman()) for d in meta.depends]
     optdeps = [pkgbash_quote(o) for o in meta.optdepends]
@@ -1925,12 +2436,15 @@ def render_pkgbuild(meta: Metadata, src_file: str, src_format: str, outdir: str)
     lines.append(f"# 原包信息: {meta.desc}")
     lines.append("")
     lines.append(f"pkgname={pkgbash_quote(meta.name)}")
-    lines.append(f"pkgver={pkgbash_quote((meta.epoch + ':' if meta.epoch else '') + meta.version)}")
+    if meta.epoch:
+        lines.append(f"epoch={pkgbash_quote(meta.epoch)}")
+    lines.append(f"pkgver={pkgbash_quote(meta.version)}")
     lines.append(f"pkgrel={pkgbash_quote(meta.release)}")
     lines.append(f"pkgdesc={pkgbash_quote(meta.desc[:250])}")
     lines.append(f"arch=({pkgbash_quote(meta.arch)})")
     lines.append(f"url={pkgbash_quote(meta.url or 'https://example.invalid')}")
-    lines.append(f"license=({pkgbash_quote(meta.license)})")
+    lines.append("license=(" + " ".join(pkgbash_quote(x) for x in meta.license.split()) + ")")
+    lines.append("options=('!strip' '!debug')")
     lines.append("depends=(" + " ".join(deps) + ")")
     if optdeps:
         lines.append("optdepends=(" + " ".join(optdeps) + ")")
@@ -1960,8 +2474,14 @@ def render_pkgbuild(meta: Metadata, src_file: str, src_format: str, outdir: str)
     elif src_format == "slack":
         lines.append(f"  bsdtar -xf \"$srcdir/{rel_src}\" -C \"$pkgdir\" --exclude='install'")
     elif src_format == "appimage":
-        lines.append(f"  install -Dm755 \"$srcdir/{rel_src}\" \"$pkgdir/opt/{meta.name}/{meta.name}.AppImage\"")
-        lines.append(f"  ln -s /opt/{meta.name}/{meta.name}.AppImage \"$pkgdir/usr/bin/{meta.name}\"")
+        if opts is not None:
+            pfx = (opts.prefix.format(pkgname=meta.name) if "{pkgname}" in opts.prefix
+                   else (opts.prefix.rstrip("/") + "/" + meta.name))
+        else:
+            pfx = f"/opt/{meta.name}"
+        lines.append(f"  install -Dm755 \"$srcdir/{rel_src}\" \"$pkgdir{pfx}/{meta.name}.AppImage\"")
+        lines.append("  install -d \"$pkgdir/usr/bin\"")
+        lines.append(f"  ln -s {pfx}/{meta.name}.AppImage \"$pkgdir/usr/bin/{meta.name}\"")
     elif src_format == "tarball":
         lines.append(f"  bsdtar -xf \"$srcdir/{rel_src}\" -C \"$pkgdir\"")
     else:
@@ -1976,6 +2496,7 @@ def render_pkgbuild(meta: Metadata, src_file: str, src_format: str, outdir: str)
 
 # ---------------------------------------------------------------------------
 # 安装闭环: pacman -U 失败 → 诊断 → 自动修复 → 重试
+# install loop: pacman -U fails -> diagnose -> auto-repair -> retry
 # ---------------------------------------------------------------------------
 
 class PacmanRunner:
@@ -1990,17 +2511,32 @@ class PacmanRunner:
     为什么查询走 query() 而不是 run(): 无 root 时 sudo/pkexec 自身的报错
     (如 "a password is required") 会被当成 pacman 输出, 导致误判. 只读查询
     (pacman -T / -Si) 不需要提权, 因此单独走无权路径.
+
+    Wrap pacman invocation and privilege escalation.
+
+    Escalation chain (prefix resolved on first use and cached):
+      1. isolated test root ($ALLTAP_PACMAN_ROOT) / $ALLTAP_NO_SUDO / already root -> direct;
+      2. sudo -n true succeeds -> sudo -n (no password prompt);
+      3. pkexec available -> pkexec (graphical authorization);
+      4. otherwise -> die.
+
+    Read-only queries use query() instead of run(): without root, sudo/pkexec error
+    messages would be mistaken for pacman output. pacman -T / -Si need no privilege.
     """
 
     def __init__(self, opts):
         self.opts = opts
         self.bin = os.environ.get("ALLTAP_PACMAN", "pacman")
         self.root = os.environ.get("ALLTAP_PACMAN_ROOT", "")   # 测试用: 隔离安装根
+        # for testing: isolated install root
         self.no_sudo = os.environ.get("ALLTAP_NO_SUDO") == "1"
         self._prefix = None
 
     def prefix(self):
-        """解析并缓存提权前缀 (见类 docstring 的四级策略)."""
+        """解析并缓存提权前缀 (见类 docstring 的四级策略).
+
+        Resolve and cache the privilege prefix (see the class docstring's four-level chain).
+        """
         if self._prefix is not None:
             return self._prefix
         if self.root or self.no_sudo or os.geteuid() == 0:
@@ -2015,7 +2551,10 @@ class PacmanRunner:
         return self._prefix
 
     def base(self):
-        """pacman 全局参数: 测试用 --root/--dbpath + $ALLTAP_PACMAN_EXTRA."""
+        """pacman 全局参数: 测试用 --root/--dbpath + $ALLTAP_PACMAN_EXTRA.
+
+        Global pacman arguments: test-only --root/--dbpath + $ALLTAP_PACMAN_EXTRA.
+        """
         args = []
         if self.root:
             args += ["--root", self.root,
@@ -2028,6 +2567,11 @@ class PacmanRunner:
 
         quiet=True 时不回显错误输出 — 用于 repo_has() 这类"失败即预期"的探测,
         避免刷一堆 "package not found" 干扰用户.
+
+        Execute and merge stdout/stderr; timeout returns 124 (same as timeout(1)).
+
+        quiet=True suppresses error output — used by repo_has() where failure is
+        expected, avoiding a flood of "package not found" messages.
         """
         log.verb("$ " + " ".join(cmd + args))
         env = dict(os.environ)
@@ -2043,16 +2587,26 @@ class PacmanRunner:
         return p.returncode, out
 
     def run(self, args, quiet=False):
-        """带提权前缀执行 pacman (写操作: -U/-S)."""
+        """带提权前缀执行 pacman (写操作: -U/-S).
+
+        Run pacman with the privilege prefix (write operations: -U/-S).
+        """
         return self._exec(self.prefix() + self.base(), args, quiet)
 
     def query(self, args, quiet=False):
         """非特权查询 (-T / -Si 等): 只读数据库, 不走 sudo/pkexec 提权链
-        避免无 root 时把提权器报错误判为 pacman 输出"""
+        避免无 root 时把提权器报错误判为 pacman 输出
+
+        Unprivileged query (-T / -Si etc.): read-only database access, no sudo/pkexec,
+        so escalator errors cannot be mistaken for pacman output.
+        """
         return self._exec(["env", "LC_ALL=C", self.bin] + self.base(), args, quiet)
 
     def install(self, pkgpaths, overwrite=None):
-        """pacman -U; pkgpaths 可为单路径或多路径 (多包单事务)"""
+        """pacman -U; pkgpaths 可为单路径或多路径 (多包单事务)
+
+        pacman -U; pkgpaths may be one path or a list (single transaction for multiple packages).
+        """
         args = ["-U", "--noconfirm"]
         for f in overwrite or []:
             args += ["--overwrite", f]
@@ -2060,11 +2614,18 @@ class PacmanRunner:
         return self.run(args)
 
     def sync_asdeps(self, names):
-        """--asdeps 安装依赖: 标记为"被依赖"而非用户主动安装, 避免计入显式包列表."""
+        """--asdeps 安装依赖: 标记为"被依赖"而非用户主动安装, 避免计入显式包列表.
+
+        Install dependencies with --asdeps: marked as "required by another package"
+        rather than explicitly installed, so they do not enter the explicit package list.
+        """
         return self.run(["-S", "--asdeps", "--noconfirm"] + names)
 
     def repo_has(self, name):
-        """官方仓库是否有此包 (pacman -Si 返回 0 即存在)."""
+        """官方仓库是否有此包 (pacman -Si 返回 0 即存在).
+
+        Whether the official repositories contain this package (pacman -Si exit 0).
+        """
         rc, _ = self.query(["-Si", name], quiet=True)
         return rc == 0
 
@@ -2088,6 +2649,17 @@ def parse_pacman_failure(out: str):
 
     为什么不靠退出码: pacman 各种失败都返回非 0, 只能靠文本模式区分;
     LC_ALL=C 由 PacmanRunner 强制, 因此这些英文模板是稳定的.
+
+    Classify pacman failure output into repairable errors.
+
+    Returns dict:
+      kind   conflict / missing / breaks / other
+      deps   missing dependency strings (may include version constraints)
+      files  conflicting absolute file paths
+      notes  human-readable extra information
+
+    Exit codes cannot distinguish failures, so text patterns are used; LC_ALL=C is
+    forced by PacmanRunner, making these English templates stable.
     """
     result = {"kind": "other", "deps": [], "files": [], "notes": []}
 
@@ -2104,6 +2676,7 @@ def parse_pacman_failure(out: str):
     for m in PACMAN_REQUIRE_3.finditer(out):
         deps.append(m.group(1) or m.group(2))
     # 过滤误捕获的句子片段
+    # filter out sentence fragments captured by mistake
     deps = [d for d in dict.fromkeys(deps) if d and " " not in d and len(d) < 128]
     if deps:
         result["kind"] = "missing"
@@ -2118,7 +2691,11 @@ def parse_pacman_failure(out: str):
 
 
 def dep_base_name(d: str) -> str:
-    """去掉版本约束, 只留包名: "glibc>=2.38" -> "glibc"."""
+    """去掉版本约束, 只留包名: "glibc>=2.38" -> "glibc".
+
+    Strip the version constraint, leaving only the package name:
+    "glibc>=2.38" -> "glibc".
+    """
     return re.split(r"[<>=]", d.strip(), 1)[0].strip()
 
 
@@ -2127,6 +2704,11 @@ def ask_confirm(opts, question, default=True):
 
     设计取向: 非 tty (定时任务/CI/管道) 一律返回 False — 宁可停下来让用户
     手动处理, 也不在无人监督时擅自改系统. -y 是唯一跳过确认的开关.
+
+    Interactive confirmation; -y auto-approves; non-interactive environments reject.
+
+    Design: a non-TTY (cron/CI/pipe) always returns False — better to stop and let
+    the user handle it than to modify the system unattended. -y is the only bypass.
     """
     if opts.yes:
         return True
@@ -2143,7 +2725,11 @@ def ask_confirm(opts, question, default=True):
 
 
 def find_dep(meta, base):
-    """在 meta.depends 中按包名 (不含版本) 查 Dep 对象, 找不到返回 None."""
+    """在 meta.depends 中按包名 (不含版本) 查 Dep 对象, 找不到返回 None.
+
+    Find a Dep object by package name (ignoring version) in meta.depends;
+    returns None when absent.
+    """
     for d in meta.depends:
         if d.name == base:
             return d
@@ -2155,30 +2741,50 @@ class PKGSpec:
 
     tree_dir 与 work 保留到事务结束: 修复循环可能多轮 rebuild(), 需要原始的
     文件树与同一个临时目录; 清理责任在 install_transaction 的调用方 (main).
+
+    Complete context of one package to install; both the multi-package transaction
+    and the repair loop's repackaging are based on it.
+
+    tree_dir and work live until the transaction ends because the repair loop may
+    call rebuild() several times; cleanup belongs to the caller of
+    install_transaction (main).
     """
 
     def __init__(self, meta, tree_dir, outdir, work, pkgpath, fmt, srcfile):
         self.meta = meta
         self.tree_dir = tree_dir    # 包根文件树 (重打包源)
+                                    # package root file tree (source for repackaging)
         self.outdir = outdir
         self.work = work            # 临时目录, 事务结束后统一清理
+                                    # temporary directory, cleaned up after the transaction
         self.pkgpath = pkgpath
         self.fmt = fmt
         self.srcfile = srcfile
 
     def rebuild(self):
-        """按当前 meta 重新打包 (依赖被移除/改名/放宽后调用)"""
+        """按当前 meta 重新打包 (依赖被移除/改名/放宽后调用)
+
+        Repackage according to the current meta (after a dependency was removed,
+        renamed or relaxed).
+        """
         self.pkgpath = build_pkg_file(self.meta, self.tree_dir, self.outdir, self.work)
         return self.pkgpath
 
 
 def specs_with_dep(specs, base):
-    """返回 depends 中含该依赖名 (不含版本约束) 的全部 spec."""
+    """返回 depends 中含该依赖名 (不含版本约束) 的全部 spec.
+
+    Return every spec whose depends contains this dependency name (ignoring version).
+    """
     return [s for s in specs if any(d.name == base for d in s.meta.depends)]
 
 
 def batch_provided_names(specs):
-    """本批包能提供的名字集合: 包名 + provides 基名 (用于判定"同批互相满足")."""
+    """本批包能提供的名字集合: 包名 + provides 基名 (用于判定"同批互相满足").
+
+    Names provided by this batch: package names + provides base names
+    (used to decide whether the batch satisfies itself).
+    """
     names = set()
     for s in specs:
         names.add(s.meta.name)
@@ -2189,6 +2795,7 @@ def batch_provided_names(specs):
 
 # ---------------------------------------------------------------------------
 # AUR 依赖兜底: 查询 AUR RPC, 由用户决定是否用 yay/paru 补装
+# AUR fallback: query the AUR RPC; the user decides whether yay/paru should install it
 # ---------------------------------------------------------------------------
 
 AUR_RPC_TPL = "https://aur.archlinux.org/rpc/v5/info?arg[]={name}"
@@ -2200,15 +2807,26 @@ def aur_lookup(name: str):
     测试通道: ALLTAP_AUR_RPC 覆盖 URL 模板 (模板以 file: 开头时直接读本地
     文件, 便于离线 mock). 只精确匹配 Name, 不做模糊/拼音搜索.
 
-    已知局限: {name} 仅做了 '/' -> '_' 的替换, 并未百分百 URL 编码;
-    包名含 '+' (如 libc++) 时 '+' 在 query string 中会被解成空格, 可能查不到.
+    包名按 URL 规则百分百编码 ('+' -> %2B); file: 模板直接读本地文件, 便于离线 mock.
+
+    Query AUR RPC v5; returns ('found'|'absent'|'error', info dict or None).
+
+    Test channel: ALLTAP_AUR_RPC overrides the URL template; a template starting
+    with file: reads a local file for offline mocks. Only an exact Name match is
+    accepted (no fuzzy/pinyin search).
+
+    Package names are fully URL-encoded ('+' -> %2B); file: templates read the local
+    file directly for offline mocks.
     """
     tpl = os.environ.get("ALLTAP_AUR_RPC", AUR_RPC_TPL)
-    quoted = name.replace("/", "_")
-    url = tpl.replace("{name}", quoted)
+    if tpl.startswith("file:"):
+        url = tpl.replace("{name}", name.replace("/", "_"))
+    else:
+        url = tpl.replace("{name}", quote(name, safe=""))
     try:
         if url.startswith("file:"):
-            with open(url[len("file://"):], encoding="utf8") as f:
+            fpath = url[7:] if url.startswith("file://") else url[5:]
+            with open(fpath, encoding="utf8") as f:
                 body = f.read()
         else:
             if not which("curl"):
@@ -2230,7 +2848,11 @@ def aur_lookup(name: str):
 
 
 def aur_helper_cmd():
-    """AUR 助手命令; 测试通道 ALLTAP_AUR_HELPER 直接指定, 否则找 paru/yay"""
+    """AUR 助手命令; 测试通道 ALLTAP_AUR_HELPER 直接指定, 否则找 paru/yay
+
+    AUR helper command; the test channel ALLTAP_AUR_HELPER overrides it,
+    otherwise look for paru/yay.
+    """
     env = os.environ.get("ALLTAP_AUR_HELPER")
     if env:
         return shlex.split(env)
@@ -2241,7 +2863,11 @@ def aur_helper_cmd():
 
 
 def aur_install(names, opts):
-    """用 AUR 助手补装 (不提权, AUR helper 自行处理); 返回 True/False"""
+    """用 AUR 助手补装 (不提权, AUR helper 自行处理); 返回 True/False
+
+    Install with an AUR helper (no privilege escalation here; the helper handles it);
+    returns True/False.
+    """
     cmdbin = aur_helper_cmd()
     if not cmdbin:
         log.warn("未找到 yay/paru, 无法补装 AUR 依赖")
@@ -2257,7 +2883,11 @@ def aur_install(names, opts):
 
 
 def aur_summary(info):
-    """把 AUR RPC 的一条 info 压成一行人类可读摘要 (版本/维护者/状态/票数)."""
+    """把 AUR RPC 的一条 info 压成一行人类可读摘要 (版本/维护者/状态/票数).
+
+    Compress one AUR RPC info record into a human-readable line
+    (version / maintainer / status / votes).
+    """
     bits = [f"版本 {info.get('Version', '?')}"]
     maint = info.get("Maintainer")
     bits.append(f"维护者 {maint}" if maint else "孤儿包 (无维护者)")
@@ -2273,6 +2903,12 @@ def try_aur_packages(bases, opts):
     """对仓库缺失的依赖查询 AUR; 返回 (可装列表 [(name, info)], 未查询到/失败列表).
 
     未启用 --aur 时不做任何网络请求, 直接把全部 bases 归入 skip (保持原有流程).
+
+    Query AUR for dependencies missing from the repositories; returns
+    (installable [(name, info)], not-found/failed list).
+
+    Without --aur no network request is made and every base goes to skip, keeping
+    the original flow.
     """
     installable, skip = [], []
     if not opts.aur:
@@ -2292,6 +2928,8 @@ def try_aur_packages(bases, opts):
 
 # ---------------------------------------------------------------------------
 # 未知依赖处理: 交互改名/移除 (多包版, 定位依赖归属的包并重打包受影响者)
+# unknown dependency handling: interactive rename/remove (multi-package version; locate the owning
+# package and repackage it)
 # ---------------------------------------------------------------------------
 
 def handle_unknown_deps(specs, names, opts):
@@ -2299,6 +2937,12 @@ def handle_unknown_deps(specs, names, opts):
 
     返回 ('rebuild'|'abort', 受影响的 spec 列表).
     -y 模式直接移除 (无人监督的默认策略), 非 tty 环境则中止而非擅动.
+
+    Dependencies found in neither the repositories nor the AUR: interactive
+    remove/rename.
+
+    Returns ('rebuild'|'abort', affected specs). -y removes them directly (the
+    unattended default); a non-TTY environment aborts rather than acting blindly.
     """
     log.warn(f"仓库中找不到依赖: {', '.join(names)}")
     for n in names:
@@ -2353,6 +2997,8 @@ def handle_unknown_deps(specs, names, opts):
 
 # ---------------------------------------------------------------------------
 # 安装事务: 一次 pacman -U 装全部包, 失败诊断修复后整批重试
+# install transaction: one pacman -U for all packages, diagnose failures, repair, then retry the
+# batch
 # ---------------------------------------------------------------------------
 
 def install_transaction(specs, opts):
@@ -2369,6 +3015,19 @@ def install_transaction(specs, opts):
     防死循环三道锁: relaxed_deps (已放宽过的依赖不再放宽)、
     installed_deps (已补装的不再重复补)、overwrite_files (同一文件不重复询问).
     上限 max_tries (默认 5).
+
+    Multi-package self-healing install loop; True means the whole batch installed.
+
+    State machine (each round is a full pacman -U, then classify and repair):
+      file conflict -> ask, then add exact --overwrite paths
+      missing deps  -> (1) provided by the batch but version mismatch -> relax and repackage
+                       (2) in the official repo -> pacman -S --asdeps
+                       (3) not in repo -> AUR lookup (--aur) -> yay/paru
+                       (4) otherwise -> interactive remove/rename and repackage
+      other         -> fail (built packages are kept)
+
+    Three anti-loop guards: relaxed_deps (never relax twice), installed_deps (never
+    install twice), overwrite_files (never ask twice). Limit: max_tries (default 5).
     """
     if len(specs) == 1:
         log.info(f"\n=== 安装: {specs[0].meta.name} ===")
@@ -2377,6 +3036,8 @@ def install_transaction(specs, opts):
         for s in specs:
             log.info(f"    {s.meta.name} {s.meta.fullver}  <- {os.path.basename(s.srcfile)}")
         # 依赖由同批包互相满足的情况, pacman 同一事务会自动解决; 此处仅提示
+        # dependencies satisfied within the same batch are resolved by pacman in one transaction;
+        # only a hint is printed here
         batch_names = batch_provided_names(specs)
         for s in specs:
             cross = sorted({d.name for d in s.meta.depends if d.name in batch_names})
@@ -2385,9 +3046,12 @@ def install_transaction(specs, opts):
 
     runner = PacmanRunner(opts)
     installed_deps = set()      # 已补装的仓库/AUR 依赖名
+                                # repository/AUR dependencies already installed
     relaxed_deps = set()        # 已放宽过版本的依赖名 (防死循环)
+                                # dependencies whose version was already relaxed (prevents infinite loops)
     max_tries = max(1, opts.max_tries)
     overwrite_files = []         # 已确认要 --overwrite 的精确路径
+                                 # exact paths already confirmed for --overwrite
 
     for attempt in range(1, max_tries + 1):
         pkgnames = " ".join(os.path.basename(s.pkgpath) for s in specs)
@@ -2402,6 +3066,11 @@ def install_transaction(specs, opts):
         # ---------- 文件冲突 ----------
         # pacman 的 "exists in filesystem" 不会自动覆盖; 用精确路径 --overwrite
         # 只放行本次确认的文件, 不用通配符, 避免误伤其它包的同名文件.
+        # ---------- file conflicts ----------
+        # pacman's "exists in filesystem" is not overwritten automatically; use exact --overwrite
+        # paths
+        # only allow the files confirmed this round; no wildcards, to avoid clobbering same-named
+        # files of other packages.
         if diag["kind"] == "conflict" and diag["files"]:
             files = [f for f in diag["files"] if f not in overwrite_files]
             if not files:
@@ -2426,6 +3095,12 @@ def install_transaction(specs, opts):
         #   batch_hit  本批包就能提供 (理论上应自动满足, 报错说明版本约束不符)
         #   repo_yes   官方仓库有 -> 可补装
         #   repo_no    仓库没有 -> 只能 AUR 或人工处理
+        # ---------- missing dependencies ----------
+        # split versioned dependency strings into base names, then classify into three groups:
+        # batch_hit provided by a package in this batch (should be satisfied automatically; an error
+        # means a version mismatch)
+        # repo_yes present in the official repositories -> can be installed automatically
+        # repo_no not in the repositories -> only AUR or manual handling
         if diag["kind"] == "missing" and diag["deps"]:
             for n in diag["notes"]:
                 log.warn(n)
@@ -2441,6 +3116,10 @@ def install_transaction(specs, opts):
 
             # ① 同批包名也无法满足 -> 版本约束过严, 放宽后重打包
             # 典型场景: A 依赖 B>=2.0, 但本批打的 B 是 1.9 — 同事务也解不了.
+            # (1) even the batch cannot satisfy it -> version constraint too strict; relax and
+            # repackage
+            # typical case: A depends on B>=2.0, but the batch builds B 1.9 — even one transaction
+            # cannot solve it.
             if batch_hit:
                 affected = []
                 relax = []
@@ -2468,6 +3147,12 @@ def install_transaction(specs, opts):
             # ② 仓库有: 补装; 版本约束过严时放宽重打包
             # 判断依据: 首轮先补装; 若补装过 (need 为空) 仍报缺, 说明仓库版本
             # 不满足源包写的约束 (或依赖根本不在仓库), 此时才放宽.
+            # (2) present in the repository: install; if the version is too strict, relax and
+            # repackage
+            # rationale: install first; if it was already installed (need is empty) but still
+            # reported missing, the repo version
+            # does not satisfy the constraint written by the source package (or the dep is not in
+            # the repo); only then relax.
             if repo_yes:
                 relax = []
                 relax_specs = []
@@ -2481,6 +3166,7 @@ def install_transaction(specs, opts):
                         if s not in relax_specs:
                             relax_specs.append(s)
                 # 已补装仍报缺 -> 版本不满足, 放宽重打包
+                # already installed but still missing -> version mismatch; relax and repackage
                 need = [b for b in repo_yes if b not in installed_deps]
                 if relax and not need:
                     for d in relax:
@@ -2509,6 +3195,7 @@ def install_transaction(specs, opts):
                 return False
 
             # ③ 仓库无: AUR 兜底 (--aur) -> 询问 yay/paru 补装
+            # (3) not in the repository: AUR fallback (--aur) -> ask yay/paru to install
             if repo_no:
                 aur_ok, aur_rest = try_aur_packages(repo_no, opts)
                 if aur_ok:
@@ -2537,6 +3224,7 @@ def install_transaction(specs, opts):
                 return False
 
         # ---------- 其它失败 ----------
+        # ---------- other failures ----------
         for n in diag["notes"]:
             log.warn(n)
         log.warn("安装失败且无法自动修复; 成品包保留: "
@@ -2549,6 +3237,7 @@ def install_transaction(specs, opts):
 
 # ---------------------------------------------------------------------------
 # --dry-run 安装计划预演: 依赖求解 + 文件冲突预检, 不执行任何安装
+# --dry-run install plan: dependency solving + file-conflict pre-check, no installation
 # ---------------------------------------------------------------------------
 
 def local_db_files():
@@ -2558,6 +3247,14 @@ def local_db_files():
     其中 %FILES% 段每行一个相对路径 (目录以 '/' 结尾).
     包名从目录名 rsplit('-', 2) 推出 (name-version-rel); 包名本身含 '-' 时
     也能正确处理. 读不到 (测试隔离根尚未初始化) 时返回 None.
+
+    Read the pacman local database files list -> {absolute path: package name},
+    regular files only.
+
+    Location: <root>/var/lib/pacman/local/<pkgname-ver-rel>/files, where the %FILES%
+    section lists one relative path per line (directories end with '/').
+    The package name is derived with rsplit('-', 2), which also works for names
+    containing '-'. Returns None when unreadable (e.g. an uninitialized test root).
     """
     root = os.environ.get("ALLTAP_PACMAN_ROOT", "")
     dbdir = os.path.join(root or "/", "var", "lib", "pacman", "local")
@@ -2588,9 +3285,18 @@ def dry_run_report(specs, runner, opts):
     只读操作: pacman -T / -Si + 本地数据库文件比对; 不调用任何会写盘的命令.
     产生的计划同时落盘到 <output>/alltap-plan.txt, 便于事后对照/审批.
 
-    已知局限: pacman -T 的输出元素可能带版本约束 (如 foo>=1.2),
-    repo_has() 直接拿整串去 -Si 可能误判为"仓库无"; 文件冲突预检也
-    无法发现"不属于任何包的散落文件"以及符号链接目录下的内容.
+    已知局限: 文件冲突预检只能比对本地 pacman 数据库, 无法发现
+    "不属于任何包的散落文件"以及符号链接目录下的内容.
+
+    Print an install plan (dependencies to install / files to overwrite / items
+    needing a decision) without changing the system.
+
+    Read-only: pacman -T / -Si plus local database comparison; no writing command.
+    The plan is also saved to <output>/alltap-plan.txt for later review/approval.
+
+    Limitation: file-conflict pre-check only compares against the local pacman
+    database; loose files not owned by any package and content under symlinked
+    directories cannot be detected.
     """
     lines = []
     emit = lines.append
@@ -2605,6 +3311,8 @@ def dry_run_report(specs, runner, opts):
     batch_names = batch_provided_names(specs)
 
     # --- 依赖求解: 同批提供 / pacman -T 缺失 / 仓库可补 / 需人工 ---
+    # --- dependency solving: provided by batch / missing per pacman -T / installable from repo /
+    # manual ---
     sched_deps = []
     for s in specs:
         for d in s.meta.depends:
@@ -2612,6 +3320,7 @@ def dry_run_report(specs, runner, opts):
             if key not in sched_deps:
                 sched_deps.append(key)
     # 剔除同批可满足的 (pacman -U 同一事务自动解决)
+    # drop the ones satisfied by this batch (pacman -U resolves them in one transaction)
     cross = sorted({dep_base_name(d) for d in sched_deps if dep_base_name(d) in batch_names})
     check = [d for d in sched_deps if dep_base_name(d) not in batch_names]
 
@@ -2631,7 +3340,13 @@ def dry_run_report(specs, runner, opts):
             emit("  ✓ 全部依赖已满足, 无需补装")
         elif missing is not None:
             repo_plan, ask_plan, aur_plan = [], [], []
-            for b in missing:
+            # pacman -T 的输出可能带版本约束 (如 "foo>=1.2"), 查仓库时必须用基名
+            # pacman -T output may contain version constraints (e.g. "foo>=1.2"); use the base name
+            # when querying the repo
+            for miss in missing:
+                b = dep_base_name(miss)
+                if not b or b in repo_plan or b in ask_plan:
+                    continue
                 if runner.repo_has(b):
                     repo_plan.append(b)
                 else:
@@ -2651,6 +3366,7 @@ def dry_run_report(specs, runner, opts):
                 emit("    安装时若选择移除, 可能导致运行时缺库")
 
     # --- 文件冲突预检: 与本地数据库已登记文件比对 ---
+    # --- file-conflict pre-check: compare with files registered in the local database ---
     emit("")
     owned = local_db_files()
     conflicts = []
@@ -2673,9 +3389,11 @@ def dry_run_report(specs, runner, opts):
         else:
             emit("文件冲突预检: 与已装包无文件冲突")
         # 提醒: 不受 pacman 管理的落盘文件无法静态预检
+        # note: loosely dropped files not owned by any package cannot be pre-checked statically
     emit("  (注: 不属于任何包的散落文件冲突无法静态预检, 以实际安装为准)")
 
     # --- 脚本提醒 ---
+    # --- script reminder ---
     scripted = [s.meta.name for s in specs if s.meta.scripts and "__raw__" not in s.meta.scripts]
     if scripted:
         emit("")
@@ -2697,11 +3415,14 @@ def dry_run_report(specs, runner, opts):
 
 # ---------------------------------------------------------------------------
 # 每包转换总控
+# per-package conversion orchestrator
 # ---------------------------------------------------------------------------
 
 HANDLERS = {
     # 格式标识 (detect_format 的返回值) -> 解析函数
     # 所有 handler 签名统一为 (path, opts) -> (Metadata, 文件树目录, 临时目录)
+    # format identifier (detect_format return value) -> parser function
+    # all handlers share the signature (path, opts) -> (Metadata, tree dir, temp dir)
     "deb": pkg_deb, "rpm": pkg_rpm, "apk": pkg_apk, "slack": pkg_slack,
     "appimage": pkg_appimage, "tarball": pkg_tarball, "archpkg": pkg_archpkg,
 }
@@ -2715,9 +3436,18 @@ def convert_one(path: str, opts) -> Optional[str]:
       * PKGSpec   -i 或 --dry-run 模式, 需要参与后续安装事务
       * str       成品包或 PKGBUILD 的路径
 
-    work 目录的生命周期: 普通模式在本函数末尾清理; -i/--dry-run 保留给
-    修复循环重打包用, 由 main 在事务结束后 finally 统一清理.
-    (已知问题: -p 模式直接 return, 未清理 work, 会残留临时目录)
+    work 目录的生命周期: 普通模式与 -p 模式在本函数末尾清理;
+    -i/--dry-run 保留给修复循环重打包用, 由 main 在事务结束后 finally 统一清理.
+
+    Convert a single package file.
+
+    Three possible return values, distinguished by main:
+      * None       failed/skipped (reason already printed)
+      * PKGSpec    -i or --dry-run mode; participates in the install transaction
+      * str        path to the built package or PKGBUILD
+
+    work lifetime: normal and -p modes clean it at the end of this function;
+    -i/--dry-run keeps it for repackaging and main cleans it in a finally block.
     """
     log.info(f"\n==> 转换: {os.path.basename(path)}")
     opts.translator.reset()
@@ -2736,6 +3466,7 @@ def convert_one(path: str, opts) -> Optional[str]:
         return None
 
     # CLI 覆盖
+    # CLI overrides
     if opts.name:
         meta.name = sanitize_pkgname(opts.name)
     if opts.desc:
@@ -2748,6 +3479,8 @@ def convert_one(path: str, opts) -> Optional[str]:
         meta.license = opts.license
     if opts.version:
         # -v/--pkgver 对全部格式生效, 支持 "1.2" 或 "1.2-3" (后者同时覆盖 pkgrel)
+        # -v/--pkgver applies to all formats, accepts "1.2" or "1.2-3" (the latter also overrides
+        # pkgrel)
         e, v, r = split_deb_version(opts.version)
         meta.epoch, meta.version, meta.release = e, sanitize_ver(v), sanitize_rel(r)
 
@@ -2776,6 +3509,10 @@ def convert_one(path: str, opts) -> Optional[str]:
     if opts.pkgbuild:
         # PKGBUILD 模式: 原包复制到目录里, 附带 .install 脚本
         # 注意: 原包按文件名复制, PKGBUILD 里 source/noextract 引用同一名字.
+        # PKGBUILD mode: copy the original package into the directory together with an .install
+        # script
+        # note: the original package is copied under its filename; PKGBUILD source/noextract refer
+        # to the same name.
         shutil.copy2(path, os.path.join(outdir, os.path.basename(path)))
         if meta.scripts and "__raw__" not in meta.scripts:
             wanted = [k for k in ("pre_install", "post_install", "pre_upgrade",
@@ -2785,7 +3522,7 @@ def convert_one(path: str, opts) -> Optional[str]:
                 chunks.append(f"{k}() {{\n{meta.scripts[k]}\n}}\n")
             with open(os.path.join(outdir, f"{meta.name}.install"), "w", encoding="utf8") as f:
                 f.write("\n".join(chunks) + "\n")
-        pb = render_pkgbuild(meta, os.path.basename(path), fmt, outdir)
+        pb = render_pkgbuild(meta, os.path.basename(path), fmt, outdir, opts)
         if os.path.exists(os.path.join(outdir, f"{meta.name}.install")):
             with open(pb, encoding="utf8") as f:
                 body = f.read()
@@ -2794,6 +3531,7 @@ def convert_one(path: str, opts) -> Optional[str]:
                 f.write(body)
         log.info(f"    ✓ 已生成 PKGBUILD: {pb}")
         log.info(f"      请在其中目录执行: cd {outdir} && makepkg -sf")
+        shutil.rmtree(work, ignore_errors=True)
         return pb
 
     pkgpath = build_pkg_file(meta, tree_dir, outdir, work)
@@ -2801,6 +3539,7 @@ def convert_one(path: str, opts) -> Optional[str]:
     log.info(f"      安装: sudo pacman -U {pkgpath}")
 
     # 翻译记录 (安装事务模式下同样保留, 便于事后审计)
+    # translation report (also kept in install-transaction mode for later audit)
     if tr.translated or tr.unresolved:
         with open(os.path.join(outdir, "alltap-report.txt"), "w", encoding="utf8") as f:
             f.write(f"source: {os.path.basename(path)}\nformat: {fmt}\n")
@@ -2810,6 +3549,7 @@ def convert_one(path: str, opts) -> Optional[str]:
             f.write("\n".join(tr.unresolved) + "\n")
 
     # 安装预演 / 安装事务模式: 返回 PKGSpec, work 由主流程统一清理
+    # install preview / transaction mode: return PKGSpec; main cleans up work afterwards
     if opts.install or opts.dry_run:
         return PKGSpec(meta, tree_dir, outdir, work, pkgpath, fmt, path)
 
@@ -2818,6 +3558,7 @@ def convert_one(path: str, opts) -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 # deb control 解析 (RFC822 continuation)
+# deb control parser (RFC822 continuation lines)
 # ---------------------------------------------------------------------------
 
 def parse_deb_control(text: str):
@@ -2826,6 +3567,12 @@ def parse_deb_control(text: str):
     - 空行结束当前字段 (control 通常只有一个段落, 但 md5sums 等会多段);
     - 以空格/制表符开头的行是上一字段的续行, strip 后用 '\n' 拼回;
     - Description 的长描述就是靠这种续行实现的 (续行以 ' .' 表示空行).
+
+    Parse a deb control file (RFC822 style: Key: Value + indented continuation lines).
+
+    A blank line ends the current field; lines starting with space/tab continue the
+    previous field (stripped and rejoined with '\n'); Description long text uses
+    this mechanism, with ' .' representing a blank line.
     """
     fields = {}
     cur = None
@@ -2850,6 +3597,12 @@ def main():
 
     退出码: 0 全部成功; 2 至少一个文件失败 (便于脚本判断).
     多文件时单个文件失败不会中断整批 (除非 handler 内部 die 抛 SystemExit).
+
+    CLI entry: parse arguments -> convert each file -> (optional) transaction
+    install -> summarize exit code.
+
+    Exit codes: 0 all succeeded; 2 at least one file failed (useful for scripts).
+    A single failure does not stop the batch.
     """
     ap = argparse.ArgumentParser(
         prog=PROG, description="alltap — 把 (几乎) 所有 Linux 软件包转换成 Arch Linux 包",
@@ -2921,15 +3674,23 @@ def main():
             die(f"文件不存在: {p}")
     # 安装/预演模式下保留未识别依赖, 交由 pacman 判定仓库有无并触发修复回路
     # (否则未知依赖在转换阶段就被剔除, 安装时永远不会报缺, 闭环无从触发.)
+    # in install/dry-run mode unknown deps are kept and left to pacman, so the repair loop can
+    # trigger
+    # (otherwise unknown deps are dropped during conversion, so installation never reports them and
+    # the repair loop cannot trigger.)
     if (args.install or args.dry_run) and not args.keep_unknown_deps:
         args.keep_unknown_deps = True
         log.verb("安装/预演模式: 未识别依赖将保留原名, 由安装闭环判定处理")
     # translator 提前挂到 args 上
+    # attach the translator to args early
     args.translator = Translator(args)
 
     ok, fail, specs = [], [], []
     # 逐文件转换: 单个失败只记入 fail, 不中断后面的包
-    # (handler 内部若调 die 抛 SystemExit, 仍会中断整批 — 已知局限)
+    # (handler 内部的 die() 抛 SystemExit, 已单独捕获并按失败处理)
+    # per-file conversion: a single failure is recorded in fail and does not stop the remaining
+    # packages
+    # (die() inside a handler raises SystemExit; it is caught per file and counted as a failure)
     for p in args.packages:
         try:
             r = convert_one(p, args)
@@ -2939,6 +3700,12 @@ def main():
                 ok.append(os.path.basename(p))
                 if isinstance(r, PKGSpec):
                     specs.append(r)
+        except SystemExit:
+            # handler 内部的 die() 抛 SystemExit; 按文件计失败后继续处理其余文件
+            # die() inside a handler raises SystemExit; the file is counted as failed and the rest
+            # continue
+            fail.append(os.path.basename(p))
+            continue
         except Exception as e:
             if log.verbose:
                 import traceback
@@ -2949,6 +3716,10 @@ def main():
 
     # 多包事务: 全部转换成功后一次 pacman -U (依赖互相满足) / --dry-run 出计划
     # 无论安装成败都要清理临时目录 (finally), 因为成品包已落到 outdir.
+    # multi-package transaction: after all conversions succeed, run one pacman -U (deps satisfy each
+    # other) / --dry-run prints the plan
+    # clean up the temporary directory regardless of success (finally), because the built packages
+    # are already in outdir.
     if specs:
         try:
             if args.dry_run:
@@ -2959,6 +3730,7 @@ def main():
                     log.warn("安装事务未成功; 成品包与报告已保留, 可手动处理 (-U 手动安装)")
         finally:
             for sp in specs:           # 统一清理重打包用临时目录
+                                       # clean up temp directories used for repackaging
                 shutil.rmtree(sp.work, ignore_errors=True)
 
     print()

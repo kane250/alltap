@@ -36,6 +36,60 @@ run tests/fixtures/CoolApp-2.5.AppImage                coolapp
 run tests/fixtures/helloworld-1.0.tar.gz               helloworld
 run tests/fixtures/topdir-usr-tree.tar.gz              myapp
 
+
+# 仅校验 PKGBUILD 语法/变量 (不打包), 同样规避 root 限制
+mkpkg_srcinfo() {
+    local d="$1"
+    if [ "$(id -u)" = "0" ]; then
+        chown -R nobody: "$d" 2>/dev/null || chmod -R a+rwX "$d"
+        ( cd "$d" && runuser -u nobody -- env HOME=/tmp makepkg --printsrcinfo > /dev/null 2>&1 )
+    else
+        ( cd "$d" && makepkg --printsrcinfo > /dev/null 2>&1 )
+    fi
+}
+
+# ---- P1 回归 ----
+# 1) 顶层目录本身就是 usr/ 时不得被当作包装层剥掉
+rm -rf "$OUT/usrdemo"
+if ./alltap tests/fixtures/usr-tree.tar.gz -n usrdemo -o "$OUT" -q 2>/dev/null \
+   && bsdtar -tf "$OUT/usrdemo/"*.pkg.tar.zst 2>/dev/null | grep -qx 'usr/bin/usrdemo'; then
+    echo "✓ tarball 顶层 usr/ 路径保留"; PASS=$((PASS+1))
+else
+    echo "✗ tarball 顶层 usr/ 路径被剥离"; FAIL=$((FAIL+1))
+fi
+
+# 2) 无系统树 + 自定义 prefix 不得出现 "move into itself"
+rm -rf "$OUT/plaindemo"
+if ./alltap tests/fixtures/plain-tree.tar.gz -n plaindemo \
+      --prefix '/usr/local/{pkgname}' -o "$OUT" -q 2>/dev/null \
+   && bsdtar -tf "$OUT/plaindemo/"*.pkg.tar.zst 2>/dev/null | grep -qx 'usr/local/plaindemo/readme.txt'; then
+    echo "✓ tarball 自定义 prefix 安装路径正确"; PASS=$((PASS+1))
+else
+    echo "✗ tarball 自定义 prefix 失败"; FAIL=$((FAIL+1))
+fi
+
+# 3) 带 epoch 的包: PKGBUILD 必须用独立 epoch 变量, pkgver 不得含冒号
+rm -rf "$OUT/epochpb"
+if ./alltap tests/fixtures/epochdemo_2.0-3_amd64.deb -o "$OUT/epochpb" -p -q 2>/dev/null \
+   && grep -qx "epoch='1'" "$OUT/epochpb/epochdemo/PKGBUILD" \
+   && grep -qx "pkgver='2.0'" "$OUT/epochpb/epochdemo/PKGBUILD" \
+   && grep -qx "options=('!strip' '!debug')" "$OUT/epochpb/epochdemo/PKGBUILD" \
+   && mkpkg_srcinfo "$OUT/epochpb/epochdemo"; then
+    echo "✓ PKGBUILD epoch/options 正确且通过 makepkg 校验"; PASS=$((PASS+1))
+else
+    echo "✗ PKGBUILD epoch 处理失败"; FAIL=$((FAIL+1))
+fi
+
+# 4) AppImage 的 PKGBUILD 安装路径跟随 --prefix
+rm -rf "$OUT/appipb"
+if ./alltap tests/fixtures/CoolApp-2.5.AppImage -n coolapp \
+      --prefix '/opt/custom/{pkgname}' -o "$OUT/appipb" -p -q 2>/dev/null \
+   && grep -q '/opt/custom/coolapp/coolapp.AppImage' "$OUT/appipb/coolapp/PKGBUILD"; then
+    echo "✓ PKGBUILD AppImage 前缀生效"; PASS=$((PASS+1))
+else
+    echo "✗ PKGBUILD AppImage 前缀未生效"; FAIL=$((FAIL+1))
+fi
+
 # PKGBUILD 模式
 # makepkg 拒绝以 root 运行; 在 CI 容器 (默认 root) 中降权到 nobody 执行
 mkpkg() {

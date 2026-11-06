@@ -324,13 +324,28 @@ def make_tarballs():
         add_to_tar(tf, "myapp-9/usr/bin/myapp", b"#!/bin/sh\necho myapp-runnable\n", mode=0o755)
         add_to_tar(tf, "myapp-9/etc/myapp/myapp.conf", b"option = on\n")
     open(p2, "wb").write(buf.getvalue())
-    return p1, p2
+
+    # 回归: 顶层目录本身就是系统目录, 不能再被当成"包装层"剥掉
+    p3 = os.path.join(FIX, "usr-tree.tar.gz")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        add_to_tar(tf, "usr/bin/usrdemo", b"#!/bin/sh\necho usrdemo\n", mode=0o755)
+        add_to_tar(tf, "usr/share/usrdemo/data", b"payload\n")
+    open(p3, "wb").write(buf.getvalue())
+
+    # 回归: 无系统树 + 自定义 prefix 时不得把目录搬进自身
+    p4 = os.path.join(FIX, "plain-tree.tar.gz")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        add_to_tar(tf, "plaindemo-1.0/readme.txt", b"plain tarball\n")
+    open(p4, "wb").write(buf.getvalue())
+    return p1, p2, p3, p4
 
 
 # =====================================================================
 # 7. 安装闭环测试专用 deb (缺依赖/仓库依赖/文件冲突)
 # =====================================================================
-def make_deb_generic(pkgname, version, deps, files):
+def make_deb_generic(pkgname, version, deps, files, filename=None):
     """files: [(归档路径, 内容, mode)]"""
     control = (f"Package: {pkgname}\nVersion: {version}\nArchitecture: amd64\n"
                f"Maintainer: Test <t@example.com>\nDepends: {deps}\n"
@@ -354,9 +369,17 @@ def make_deb_generic(pkgname, version, deps, files):
     deb += ar_member("debian-binary", b"2.0\n")
     deb += ar_member("control.tar.gz", cbuf.getvalue())
     deb += ar_member("data.tar.gz", dbuf.getvalue())
-    p = os.path.join(FIX, f"{pkgname}_{version}_amd64.deb")
+    p = os.path.join(FIX, filename or f"{pkgname}_{version}_amd64.deb")
     open(p, "wb").write(deb)
     return p
+
+
+def make_epoch_deb():
+    """回归: Version 带 epoch (1:2.0-3), 用于验证 PKGBUILD 的 epoch 变量."""
+    return make_deb_generic(
+        "epochdemo", "1:2.0-3", "",
+        [("usr/bin/epochdemo", b"#!/bin/sh\necho epochdemo\n", 0o755)],
+        filename="epochdemo_2.0-3_amd64.deb")
 
 
 def make_install_fixtures():
@@ -380,6 +403,7 @@ def make_install_fixtures():
 if __name__ == "__main__":
     made = [make_deb(), make_rpm(), make_apk(), make_slack(), make_appimage()]
     made += list(make_tarballs())
+    made.append(make_epoch_deb())
     made += make_install_fixtures()
     print("已生成测试样例:")
     for p in made:

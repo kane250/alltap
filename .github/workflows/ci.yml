@@ -21,7 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Conversion regression (7 formats + PKGBUILD + repack)
+      - name: Conversion regression (7 formats + PKGBUILD + repack + P1 regressions)
         run: bash tests/run-tests.sh
 
       - name: Install-loop mock tests (10 scenarios)

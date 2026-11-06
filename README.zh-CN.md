@@ -44,7 +44,7 @@ alltap package.deb -p                 # 仅生成 PKGBUILD (debtap 兼容模式)
 alltap package.deb -o ~/pkgs          # 指定输出目录
 alltap program.rpm -k                 # 保留无法翻译的依赖原名
 alltap any.rpm -v 2.1-3               # 覆盖包版本 (全格式; 短选项 -v 与 debtap 兼容)
-alltap app.tar.gz --prefix /usr/local # 归档无系统树时的安装前缀 (默认 /opt/{pkgname})
+alltap app.tar.gz --prefix /usr/local # 无系统树的安装前缀 (默认 /opt/{pkgname}; -p 模式的 AppImage 亦生效)
 alltap a.deb b.rpm -i                 # 转换后多包单事务安装 (依赖互相满足)
 alltap a.deb b.rpm -i --dry-run       # 预演: 输出安装计划, 不实际执行
 alltap a.deb -i --aur                 # 缺失依赖时查询 AUR, 确认后 yay/paru 补装
@@ -146,10 +146,10 @@ alltap foo.deb -i --dry-run        # 只输出安装计划, 不实际执行
 ## 开发与测试
 
 ```bash
-bash tests/run-tests.sh          # 转换回归: 7 种格式 + PKGBUILD + 重打包 (10/10)
+bash tests/run-tests.sh          # 转换回归: 7 种格式 + PKGBUILD + 重打包 + 4 项 P1 回归 (14/14)
 bash tests/test-install-mock.sh  # 安装闭环 mock 测试: 10 个场景 (含多包事务/AUR/dry-run)
 bash tests/test-install-real.sh  # 真实 pacman 隔离测试 (unshare + 临时 root, 6/6)
-python3 tests/build-fixtures.py  # 单独重建全部测试样例 (13 个)
+python3 tests/build-fixtures.py  # 单独重建全部测试样例 (16 个)
 ```
 
 测试样例均为程序化构造（含手工构造的合法 RPM/cpio 流、ar 归档、.PKGINFO），外加 Fedora 官方仓库下载的真实 hello RPM。
