@@ -4,6 +4,7 @@ set -u
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 OUT=$(mktemp -d)
+chmod 755 "$OUT"   # root 容器中 nobody 构建需要穿透中间目录
 PASS=0; FAIL=0
 
 # 1. 生成 fixtures (幂等)
@@ -50,13 +51,7 @@ mkpkg() {
     if [ "$rc" != 0 ]; then
         echo "---- makepkg 失败日志 (uid=$(id -u)) ----"
         tail -30 "$OUT/makepkg.log"
-        echo "---- 环境诊断 ----"
-        id nobody 2>&1 || true
-        ls -ld /tmp "$OUT" "${d%/*}" "$d" 2>&1 || true
-        runuser -u nobody -- ls -ld "$d" 2>&1 || true
-        runuser -u nobody -- env HOME=/tmp passwd --status 2>/dev/null || true
-        runuser -u nobody -- env HOME=/tmp bash -c 'cd "$1" && pwd -P && id && stat -c "%U %a" .' _ "$d" 2>&1 || true
-        echo "------------------"
+        echo "------------------------------------------"
     fi
     return $rc
 }
