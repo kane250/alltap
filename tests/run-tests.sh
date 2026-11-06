@@ -36,10 +36,20 @@ run tests/fixtures/helloworld-1.0.tar.gz               helloworld
 run tests/fixtures/topdir-usr-tree.tar.gz              myapp
 
 # PKGBUILD 模式
+# makepkg 拒绝以 root 运行; 在 CI 容器 (默认 root) 中降权到 nobody 执行
+mkpkg() {
+    local d="$1"
+    if [ "$(id -u)" = "0" ]; then
+        chown -R nobody: "$d" 2>/dev/null || chmod -R a+rwX "$d"
+        ( cd "$d" && runuser -u nobody -- env HOME=/tmp makepkg -f -d > /dev/null 2>&1 )
+    else
+        ( cd "$d" && makepkg -f -d > /dev/null 2>&1 )
+    fi
+}
 rm -rf "$OUT/pbmode"
 if ./alltap tests/fixtures/alltapdemo_1.4-2ubuntu1_amd64.deb -o "$OUT/pbmode" -p -q 2>/dev/null \
    && [ -f "$OUT/pbmode/alltapdemo/PKGBUILD" ]; then
-    ( cd "$OUT/pbmode/alltapdemo" && makepkg -f -d > /dev/null 2>&1 )
+    mkpkg "$OUT/pbmode/alltapdemo"
     if ls "$OUT/pbmode/alltapmode"/*.pkg.tar.zst > /dev/null 2>&1; then :; fi
     if ls "$OUT/pbmode/alltapdemo"/*.pkg.tar.zst > /dev/null 2>&1 \
        && pacman -Qp "$OUT/pbmode/alltapdemo"/*.pkg.tar.zst > /dev/null 2>&1; then
