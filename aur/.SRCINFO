@@ -1,6 +1,6 @@
 pkgbase = alltap
 	pkgdesc = 把 (几乎) 所有 Linux 软件包格式转换成 Arch 包: deb/rpm/apk/tgz/AppImage/tarball, 含安装自愈闭环
-	pkgver = 1.1.0
+	pkgver = 1.2.0
 	pkgrel = 1
 	url = https://github.com/kane250/alltap
 	arch = any
@@ -9,7 +9,7 @@ pkgbase = alltap
 	depends = libarchive
 	depends = zstd
 	optdepends = pacman: 本地仓库匹配与安装支持
-	source = https://github.com/kane250/alltap/releases/download/v1.1.0/alltap-1.1.0.tar.gz
-	sha256sums = bfca012ec0d7dcde80ec7133ab60198668e7e6cc10921778e149d646f371a218
+	source = https://github.com/kane250/alltap/releases/download/v1.2.0/alltap-1.2.0.tar.gz
+	sha256sums = 8278c311fb2125e3d16c846d0f63ef2c73cae9d1871e7e3913e7430ce83bdf50
 
 pkgname = alltap
