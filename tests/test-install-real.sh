@@ -19,6 +19,20 @@ PASS=0; FAIL=0
 say_ok()  { echo "✓ $*"; PASS=$((PASS+1)); }
 say_bad() { echo "✗ $*"; FAIL=$((FAIL+1)); }
 
+# 隔离执行包装: 本地优先 unshare -r; 在不支持用户命名空间的环境
+# (如 GitHub Actions 容器, CLONE_NEWUSER 被 seccomp 拦截) 且当前已是 root 时
+# 自动降级为直接执行 (一次性 CI 容器, 污染无碍)
+if unshare -r true 2>/dev/null; then
+    run_real() { unshare -r bash -c "$1"; }
+else
+    if [ "$(id -u)" != "0" ]; then
+        echo "✗ 环境既不支持 unshare -r 也不是 root, 无法运行真实 pacman 测试" >&2
+        exit 1
+    fi
+    echo "(环境不支持用户命名空间, root 直接执行)"
+    run_real() { bash -c "$1"; }
+fi
+
 echo "=== alltap 真实 pacman 安装闭环测试 $(date '+%F %T') ==="
 echo "隔离根目录: $ROOT"
 
@@ -26,7 +40,7 @@ echo "隔离根目录: $ROOT"
 CMD="export ALLTAP_NO_SUDO=1 ALLTAP_PACMAN_ROOT='$ROOT' ALLTAP_PACMAN_EXTRA='--config $CONF'
 cd '$PROJ'
 ./alltap tests/fixtures/topdir-usr-tree.tar.gz -o '$OUT/out/t1' -i -y --max-tries 3 -q"
-if unshare -r bash -c "$CMD" > "$OUT/t1.log" 2>&1 && [ -f "$ROOT/usr/bin/myapp" ]; then
+if run_real "$CMD" > "$OUT/t1.log" 2>&1 && [ -f "$ROOT/usr/bin/myapp" ]; then
     say_ok "真实 pacman 安装成功 (文件落地 $ROOT/usr/bin/myapp)"
 else
     say_bad "真实 pacman 正常安装失败"; tail -20 "$OUT/t1.log"
@@ -36,7 +50,7 @@ fi
 CMD="export ALLTAP_NO_SUDO=1 ALLTAP_PACMAN_ROOT='$ROOT' ALLTAP_PACMAN_EXTRA='--config $CONF'
 cd '$PROJ'
 ./alltap tests/fixtures/installtest_1.0_amd64.deb -o '$OUT/out/t2' -i -y --max-tries 4"
-unshare -r bash -c "$CMD" > "$OUT/t2.log" 2>&1
+run_real "$CMD" > "$OUT/t2.log" 2>&1
 if grep -q "nonexistent-dep-xyz" "$OUT/t2.log" \
    && grep -q "已移除上述依赖" "$OUT/t2.log" \
    && grep -q "✓ 安装成功" "$OUT/t2.log"; then
@@ -51,7 +65,7 @@ mkdir -p "$ROOT/usr/bin" && echo "preexisting" > "$ROOT/usr/bin/mockconflict"
 CMD="export ALLTAP_NO_SUDO=1 ALLTAP_PACMAN_ROOT='$ROOT' ALLTAP_PACMAN_EXTRA='--config $CONF'
 cd '$PROJ'
 ./alltap tests/fixtures/conflicttest_1.0_amd64.deb -o '$OUT/out/t3' -i -y --max-tries 4"
-unshare -r bash -c "$CMD" > "$OUT/t3.log" 2>&1
+run_real "$CMD" > "$OUT/t3.log" 2>&1
 if grep -q "检测到文件冲突" "$OUT/t3.log" && grep -q "✓ 安装成功" "$OUT/t3.log" \
    && grep -q "mockconflict" "$OUT/t3.log"; then
     say_ok "真实文件冲突 -> --overwrite 精确覆盖 -> 安装成功"
@@ -63,7 +77,7 @@ fi
 CMD="export ALLTAP_NO_SUDO=1 ALLTAP_PACMAN_ROOT='$ROOT' ALLTAP_PACMAN_EXTRA='--config $CONF'
 cd '$PROJ'
 ./alltap tests/fixtures/helloworld-1.0.tar.gz -o '$OUT/out/t4' -q"
-if unshare -r bash -c "$CMD" > /dev/null 2>&1 && [ ! -d "$ROOT/opt/helloworld" ]; then
+if run_real "$CMD" > /dev/null 2>&1 && [ ! -d "$ROOT/opt/helloworld" ]; then
     say_ok "默认模式不触发安装 (行为隔离正确)"
 else
     say_bad "默认模式意外触发了安装"
@@ -73,7 +87,7 @@ fi
 CMD="export ALLTAP_NO_SUDO=1 ALLTAP_PACMAN_ROOT='$ROOT' ALLTAP_PACMAN_EXTRA='--config $CONF'
 cd '$PROJ'
 ./alltap tests/fixtures/multia_1.0_amd64.deb tests/fixtures/multib_2.1_amd64.deb -o '$OUT/out/t5' -i -y --max-tries 3"
-unshare -r bash -c "$CMD" > "$OUT/t5.log" 2>&1
+run_real "$CMD" > "$OUT/t5.log" 2>&1
 if grep -q "依赖 multib 由同批包提供" "$OUT/t5.log" \
    && grep -q "✓ 安装成功" "$OUT/t5.log" \
    && [ -x "$ROOT/usr/bin/multa" ] && [ -x "$ROOT/usr/bin/multib" ]; then
@@ -86,7 +100,7 @@ fi
 CMD="export ALLTAP_NO_SUDO=1 ALLTAP_PACMAN_ROOT='$ROOT' ALLTAP_PACMAN_EXTRA='--config $CONF'
 cd '$PROJ'
 ./alltap tests/fixtures/multia_1.0_amd64.deb tests/fixtures/multib_2.1_amd64.deb -o '$OUT/out/t6' --dry-run -f"
-unshare -r bash -c "$CMD" > "$OUT/t6.log" 2>&1
+run_real "$CMD" > "$OUT/t6.log" 2>&1
 DRYOK=1
 grep -q "由同批包互相提供 (同一 pacman -U 事务自动满足): multib" "$OUT/t6.log" || DRYOK=0
 grep -q "此为 --dry-run 预演, 未执行任何安装" "$OUT/t6.log" || DRYOK=0
@@ -96,7 +110,7 @@ grep -q "此为 --dry-run 预演, 未执行任何安装" "$OUT/t6.log" || DRYOK=
 CMD2="export ALLTAP_NO_SUDO=1 ALLTAP_PACMAN_ROOT='$ROOT' ALLTAP_PACMAN_EXTRA='--config $CONF'
 cd '$PROJ'
 ./alltap tests/fixtures/helloworld-1.0.tar.gz -o '$OUT/out/t6b' --dry-run -f"
-unshare -r bash -c "$CMD2" > "$OUT/t6b.log" 2>&1
+run_real "$CMD2" > "$OUT/t6b.log" 2>&1
 [ -d "$ROOT/opt/helloworld" ] && DRYOK=0
 if [ "$DRYOK" == 1 ]; then
     say_ok "--dry-run 计划正确且未实际安装"

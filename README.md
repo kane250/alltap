@@ -1,170 +1,172 @@
 # alltap
 
-**把 (几乎) 所有 Linux 软件包转换成 Arch Linux 软件包** —— debtap 的全格式继任者。
+**Convert (almost) any Linux software package into an Arch Linux package** — the all-format successor to [debtap](https://github.com/helixarch/debtap).
 
-`debtap` 只能转 `.deb`；`alltap` 一个工具通吃：
+`debtap` only handles `.deb`. `alltap` handles them all in one tool:
 
-| 输入格式 | 来源发行版 | 元数据提取 | 安装脚本移植 | 测试 |
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+| Input format | Origin distros | Metadata extraction | Install script porting | Tested |
 |---|---|---|---|---|
-| `.deb` | Debian / Ubuntu / Deepin / UOS 等 | control 字段全量 | preinst/postinst/prerm/postrm（含 deb 参数语义模拟） | ✓ |
-| `.rpm` | Fedora / RHEL / openSUSE 等 | 纯 Python 解析 RPM header（gzip/xz/zstd payload） | %pre/%post/%preun/%postun + ldconfig | ✓（含 Fedora 官方真实包） |
-| `.apk` | Alpine | `.PKGINFO` 全量 | 6 种 alpine 脚本一一对应 pacman | ✓ |
-| `.tgz` / `.txz` | Slackware | slack-desc + 文件名 | doinst.sh | ✓ |
-| `.AppImage` | 任意 | 文件名/ELF 架构探测 | — （重打包到 /opt） | ✓ |
-| `.tar.gz` 等 | 任意归档 | 智能判定：含 `usr/` 等系统树→直接入包；否则装 `/opt` | — | ✓ |
-| `.pkg.tar.zst` | Arch 自身 | `.PKGINFO` 全量 | 保留原 `.INSTALL` | ✓ |
+| `.deb` | Debian / Ubuntu / Deepin / UOS … | Full control fields | preinst/postinst/prerm/postrm (with deb argument semantics emulation) | ✓ |
+| `.rpm` | Fedora / RHEL / openSUSE … | Pure-Python RPM header parsing (gzip/xz/zstd payloads) | %pre/%post/%preun/%postun + ldconfig | ✓ (incl. real Fedora package) |
+| `.apk` | Alpine | Full `.PKGINFO` | 6 alpine scripts mapped 1:1 to pacman hooks | ✓ |
+| `.tgz` / `.txz` | Slackware | slack-desc + filename | doinst.sh | ✓ |
+| `.AppImage` | Any | Filename / ELF arch detection | — (repacked into /opt) | ✓ |
+| `.tar.gz` etc. | Any tarball | Smart detection: `usr/` system tree → packed as-is, otherwise → /opt | — | ✓ |
+| `.pkg.tar.zst` | Arch itself | Full `.PKGINFO` | Original `.INSTALL` kept | ✓ |
 
-## 安装
+## Installation
 
 ```bash
-# 方式一: 直接安装 (脚本 + 映射数据库)
-./install.sh                 # 默认装到 ~/.local/bin 与 ~/.local/share/alltap
-sudo ./install.sh /usr/local # 装到系统路径
+# Option 1: install directly (script + mapping database)
+./install.sh                 # installs to ~/.local/bin and ~/.local/share/alltap
+sudo ./install.sh /usr/local # system-wide install
 
-# 方式二: makepkg 安装 (Arch 系)
+# Option 2: install via makepkg (Arch-based systems)
 makepkg -f -d && sudo pacman -U alltap-*.pkg.tar.zst
 ```
 
-依赖：`python3 ≥ 3.9`、`bsdtar`（libarchive，Arch 系自带）、`zstd`。
-**RPM 解析不需要安装任何 rpm 工具**（内置纯 Python 解析器 + cpio(newc) 解包器）。
+Runtime dependencies: `python ≥ 3.9`, `bsdtar` (libarchive, bundled with Arch), `zstd`.
+**RPM parsing requires no RPM tools whatsoever** (built-in pure-Python parser + cpio(newc) unpacker).
 
-## 使用
+## Usage
 
 ```bash
-alltap package.deb                    # 转出可直接 pacman -U 的 .pkg.tar.zst
-alltap package.rpm                    # 同上 (Fedora/RHEL/openSUSE 包)
-alltap tool.apk                       # Alpine 包
-alltap foo-1.0-x86_64-1.txz           # Slackware 包
-alltap CoolApp-2.5.AppImage -n coolapp # AppImage 重打包到 /opt/coolapp
-alltap bundle-2.1.tar.xz              # 通用归档 (自动判定系统树/二进制归档)
-alltap a.deb b.rpm c.apk              # 批量
-alltap package.deb -p                 # 仅生成 PKGBUILD (debtap 兼容模式)
-alltap package.deb -o ~/pkgs          # 指定输出目录
-alltap program.rpm -k                 # 保留无法翻译的依赖原名
-alltap any.rpm -v 2.1-3               # 覆盖包版本 (全格式; 短选项 -v 与 debtap 兼容)
-alltap app.tar.gz --prefix /usr/local # 归档无系统树时的安装前缀 (默认 /opt/{pkgname})
-alltap a.deb b.rpm -i                 # 转换后多包单事务安装 (依赖互相满足)
-alltap a.deb b.rpm -i --dry-run       # 预演: 输出安装计划, 不实际执行
-alltap a.deb -i --aur                 # 缺失依赖时查询 AUR, 确认后 yay/paru 补装
-alltap --version                      # 显示 alltap 版本 (-V 等价)
-alltap --refresh                      # 刷新 Arch 仓库包名缓存
+alltap package.deb                    # produce a pacman -U ready .pkg.tar.zst
+alltap package.rpm                    # same (Fedora/RHEL/openSUSE packages)
+alltap tool.apk                       # Alpine package
+alltap foo-1.0-x86_64-1.txz           # Slackware package
+alltap CoolApp-2.5.AppImage -n coolapp # AppImage repacked into /opt/coolapp
+alltap bundle-2.1.tar.xz              # generic archive (auto-detects system tree vs. binary bundle)
+alltap a.deb b.rpm c.apk              # batch conversion
+alltap package.deb -p                 # PKGBUILD only (debtap-compatible mode)
+alltap package.deb -o ~/pkgs          # custom output directory
+alltap program.rpm -k                 # keep untranslatable deps verbatim
+alltap any.rpm -v 2.1-3               # override package version (all formats; -v kept for debtap compat)
+alltap app.tar.gz --prefix /usr/local # install prefix for archive without system tree (default /opt/{pkgname})
+alltap a.deb b.rpm -i                 # install after conversion, multi-package single transaction
+alltap a.deb b.rpm -i --dry-run       # rehearsal: print the install plan, install nothing
+alltap a.deb -i --aur                 # fall back to AUR for missing deps, with confirmation
+alltap --version                      # show alltap version (= -V)
+alltap --refresh                      # refresh the Arch repo package-name cache
 ```
 
-输出目录结构：
+Output layout:
 
 ```
 <pkgname>/
-  ├── <pkgname>-<ver>-<rel>-<arch>.pkg.tar.zst   # 成品包
-  └── alltap-report.txt                           # 依赖翻译记录
-alltap-plan.txt                                   # (--dry-run 时) 安装计划, 位于输出目录
+  ├── <pkgname>-<ver>-<rel>-<arch>.pkg.tar.zst   # the resulting package
+  └── alltap-report.txt                           # dependency translation report
+alltap-plan.txt                                   # install plan (with --dry-run), in the output dir
 ```
 
-成品包按 makepkg 等价流程构造（`.PKGINFO` + `.MTREE` + 可选 `.INSTALL`，GNU tar 格式 + zstd 压缩，文件归一化为 root 归属），`pacman -U` 直接安装。
+Every package is built through a makepkg-equivalent pipeline (`.PKGINFO` + `.MTREE` + optional `.INSTALL`, GNU tar format + zstd compression, ownership normalized to root), directly installable via `pacman -U`.
 
-## 安装自愈闭环（`-i`）
+## Install self-healing loop (`-i`)
 
-转换只是第一步——第三方包装不上，多半卡在依赖与文件冲突。`-i` 让 alltap 转换后直接 `pacman -U` 并按失败原因自动修复、循环重试。**多包时为单一事务**：一次 `pacman -U app1.pkg app2.pkg ...`，同批包之间的互相依赖由 pacman 同事务自动满足，避免逐包安装时"A 依赖 B 而 B 尚未装"的顺序性失败：
+Conversion is only half the story — third-party packages usually fail on missing dependencies or file conflicts. With `-i`, alltap installs right after conversion and, on failure, diagnoses the cause, repairs automatically, and retries. **Multiple packages go in a single transaction**: one `pacman -U app1.pkg app2.pkg ...` resolves cross-dependencies within the batch, avoiding the "A depends on B which is not installed yet" ordering failures of per-package installs:
 
 ```
-解包+解析 ──▶ 依赖映射 ──▶ .pkg.tar.zst ────▶ pacman -U (多包单事务)
-   ×N 批量                       │                        │
-                                 │        失败: 缺依赖 ◀──┘
-                                 │          ├─ 同批包提供 → 版本不符时放宽约束重打包
-                                 │          ├─ 仓库有 → pacman -S --asdeps 补装
-                                 │          ├─ 仓库无 → (--aur) 查 AUR → yay/paru 补装
-                                 │          │            └─ 否则询问改名 / 移除 → 重打包受影响包
-                                 │          └─ 文件冲突 → --overwrite 精确覆盖
-                                 └──────(循环，直至成功或达上限)
+unpack+parse ─▶ dep mapping ─▶ .pkg.tar.zst ───▶ pacman -U (single transaction)
+  ×N batched                       │                        │
+                                   │       failure: missing dep ◀─┘
+                                   │         ├─ provided by batch → relax version constraint if needed
+                                   │         ├─ in repos → pacman -S --asdeps
+                                   │         ├─ not in repos → (--aur) query AUR → yay/paru
+                                   │         │                └─ else ask rename / remove → repack affected
+                                   │         └─ file conflict → exact --overwrite
+                                   └──(loop until success or max tries)
 ```
 
 ```bash
-alltap foo.deb -i                  # 转换后自动安装, 失败自动修复
-alltap foo.deb foo.rpm -i          # 多包单事务安装, 依赖互相满足
-alltap foo.deb -i -y               # 全自动 (补依赖/移除未知依赖/覆盖冲突都不再询问)
-alltap foo.rpm -i --max-tries 8    # 提高重试上限 (默认 5)
-alltap foo.deb -i --no-autodeps    # 不允许自动补装仓库依赖 (只报告)
-alltap foo.deb -i --no-overwrite   # 不允许自动处理文件冲突
-alltap foo.deb -i --aur            # 仓库缺失的依赖查询 AUR, 确认后 yay/paru 补装
-alltap foo.deb -i --dry-run        # 只输出安装计划, 不实际执行
+alltap foo.deb -i                  # convert, install, self-heal on failure
+alltap foo.deb foo.rpm -i          # multi-package single transaction
+alltap foo.deb -i -y               # fully automatic (no confirmation prompts)
+alltap foo.rpm -i --max-tries 8    # raise the retry limit (default 5)
+alltap foo.deb -i --no-autodeps    # forbid installing missing repo deps
+alltap foo.deb -i --no-overwrite   # forbid automatic file-conflict handling
+alltap foo.deb -i --aur            # query AUR for repo-missing deps, install via yay/paru
+alltap foo.deb -i --dry-run        # print the install plan only
 ```
 
-修复策略细节：
+Repair strategies:
 
-| 失败类型 | 判定 | 处理 | 保护 |
+| Failure | Detection | Action | Safety |
 |---|---|---|---|
-| 缺依赖 · 仓库有 | `pacman -Si` 命中 | `pacman -S --asdeps --noconfirm` 补装后重试 | `--no-autodeps` 可禁用 |
-| 缺依赖 · 仓库无 | `pacman -Si` 未命中 | `--aur` 时先查 AUR（显示版本/维护者/票数），确认后 yay/paru 补装；否则交互询问：移除 / 改名 / 放弃，仅重打包受影响的包 | 非交互环境默认拒绝；AUR 从源码构建需显式确认；`-y` 自动移除 |
-| 依赖指向同批包但版本不符 | 依赖名与本批包名/`provides` 重合 | 去掉版本约束重打包该包 | 同一依赖只放宽一次 |
-| 依赖版本过严 | 同名依赖补装后仍报缺 | 自动去掉版本约束重新打包 | 日志明示放宽了哪一条 |
-| 文件冲突 | `xxx exists in filesystem` | 收集精确路径，`--overwrite <path>` 逐路径覆盖后重试 | **绝不使用 `*` 通配**；`--no-overwrite` 可禁用 |
-| 破坏其他包依赖 | `breaks dependency ... required by ...` | 报告冲突关系后停止 | 不自动卸载他人依赖 |
+| Missing dep · in repos | `pacman -Si` hit | `pacman -S --asdeps --noconfirm`, then retry | disable via `--no-autodeps` |
+| Missing dep · not in repos | `pacman -Si` miss | With `--aur`: query AUR (version/maintainer/votes), install via `paru`/`yay -S --asdeps` after explicit confirmation; otherwise interactive rename / remove / abort — only affected packages get repacked | non-interactive defaults to abort; AUR builds need explicit confirmation; `-y` auto-removes |
+| Dep points into the batch, wrong version | dep name matches a batch package / `provides` | drop the version constraint and repack that package | each dep relaxed at most once |
+| Over-strict version | same dep still missing after install | strip the constraint and repack | logged explicitly |
+| File conflict | `xxx exists in filesystem` | collect exact paths, retry with `--overwrite <path>` per path | **never uses `*` wildcards**; disable via `--no-overwrite` |
+| Breaks other packages' deps | `breaks dependency ... required by ...` | report and stop | never auto-removes others' deps |
 
-### AUR 依赖兜底（`--aur`）
+### AUR dependency fallback (`--aur`)
 
-仓库翻译不出对应包时（典型如 Ubuntu 专用小库名），`--aur` 会查询 [AUR RPC](https://aur.archlinux.org/rpc) 接口：
+When a dependency has no repo counterpart (typical for Ubuntu-specific library names), `--aur` queries the [AUR RPC](https://aur.archlinux.org/rpc) API:
 
-- 找到则显示**版本、维护者、票数、是否过期**，确认后用 `paru`/`yay -S --asdeps` 补装（本机需已装其一），再循环重试安装；
-- 找不到或网络不可达时自动回落到改名/移除询问流程；
-- AUR 包需从源码构建、耗时且属第三方代码，因此**必须显式确认**（`-y` 且 `--aur` 同时给出才视为同意）。
+- On hit, shows **version, maintainer, votes, out-of-date status**; after confirmation installs via `paru`/`yay -S --asdeps` (one of them must be installed) and retries the loop;
+- On miss or network failure, falls back to the rename/remove flow;
+- AUR packages build from source and run third-party code — confirmation is **always required** (`-y` plus `--aur` together counts as consent).
 
-### 安装计划预演（`--dry-run`）
+### Install plan rehearsal (`--dry-run`)
 
-先审后装：转换后不执行任何安装，输出完整计划并写入 `<输出目录>/alltap-plan.txt`：
+Review before install: after conversion, no install happens. The full plan is printed and written to `<output>/alltap-plan.txt`:
 
-- **依赖求解**：`pacman -T` 检查当前系统 → 哪些已满足 / 将从仓库补装 / 由同批包互相提供 / 仓库无（需决断）；
-- **文件冲突预检**：将各包文件清单与 pacman 本地数据库已登记文件比对，列出将被 `--overwrite` 覆盖的文件及其归属包（不属于任何包的散落文件无法静态预检，以实际安装为准）；
-- **维护脚本提醒**：哪些包携带 `.INSTALL` 将以 root 执行。
+- **Dependency resolution**: `pacman -T` against the current system → satisfied / to-be-installed-from-repo / provided by the batch / not found anywhere (decision needed);
+- **File-conflict pre-check**: compares each package's file list with the pacman local database, listing files that would be `--overwrite`-ed and their owning packages (orphan files owned by no package cannot be pre-checked and remain subject to the actual install);
+- **Script warning**: which packages ship an `.INSTALL` that will run as root.
 
-补充说明：
+Notes:
 
-- `-i` / `--dry-run` 模式会自动**保留未识别依赖的原名**（普通转换模式才默认剔除），否则安装闭环无从判定；翻译失败的依赖会原样送交 pacman 判定。
-- 需要 root：以 root 运行时直接执行；普通用户优先 `sudo -n`（免密），否则用 `pkexec` 图形认证弹窗；`-T`/`-Si` 等只读查询不提权。
-- 所有 pacman 调用强制 `LC_ALL=C` 解析英文输出；重试上限后停止，已生成的包文件与 `alltap-report.txt` 完整保留。
-- 测试用隔离通道（不影响正常使用）：`ALLTAP_PACMAN`（替换 pacman 可执行）、`ALLTAP_PACMAN_ROOT`（`--root` 隔离根）、`ALLTAP_PACMAN_EXTRA`（附加参数）、`ALLTAP_NO_SUDO=1`（跳过提权）、`ALLTAP_AUR_RPC`（AUR RPC URL 模板，`{name}` 占位，`file://` 可离线 mock）、`ALLTAP_AUR_HELPER`（替换 yay/paru 命令）。
+- `-i` / `--dry-run` automatically **keep untranslatable dependencies verbatim** (plain conversion drops them), so that pacman can judge repository availability and drive the repair loop.
+- Root required for installs: runs directly as root; normal users escalate via non-interactive `sudo -n`, then `pkexec`. Read-only queries (`-T`/`-Si`) never escalate.
+- All pacman invocations run under `LC_ALL=C` for stable output parsing; after exhausting retries, generated packages and `alltap-report.txt` are preserved.
+- Test-only environment channels: `ALLTAP_PACMAN` (override pacman binary), `ALLTAP_PACMAN_ROOT` (`--root` isolated root), `ALLTAP_PACMAN_EXTRA` (extra args), `ALLTAP_NO_SUDO=1` (skip escalation), `ALLTAP_AUR_RPC` (AUR RPC URL template with `{name}` placeholder, supports `file://` for offline mocking), `ALLTAP_AUR_HELPER` (override yay/paru command).
 
-## 依赖翻译原理
+## How dependency translation works
 
-三层策略（`data/dep-map.conf` 约 750 条规则 + 内嵌兜底子集）：
+Three layers (`data/dep-map.conf`, ~750 rules + an embedded subset):
 
-1. **精确映射**：`libc6 => glibc`、`openssl-libs => openssl`、`libssh2.so.1 => libssh2` 等手写规则，覆盖 deb 包名 / rpm soname / SPDX 许可证别名；
-2. **本地仓库匹配**：解析名（或剥去 soname 数字、`-dev`/`-devel` 后缀、`lib` 前缀后的变体）与 `pacman -Slq` 的官方包名比对；
-3. **正则规则**：`libllvm14 → llvm-libs`、`libicu72 → icu`、`libboost_* → boost-libs` 等。
+1. **Exact mapping**: `libc6 => glibc`, `openssl-libs => openssl`, `libssh2.so.1 => libssh2`, SPDX license aliases …;
+2. **Local repo match**: candidate names (or variants after stripping soname digits, `-dev`/`-devel` suffixes, `lib` prefixes) compared against `pacman -Slq` names;
+3. **Regex rules**: `libllvm14 → llvm-libs`, `libicu72 → icu`, `libboost_* → boost-libs` …
 
-无法翻译的依赖默认剔除并在末尾汇总提示（`-k` 保留原名）；发行版基础设施依赖（`debconf`、`dpkg`、`rpmlib(...)`、`config(...)`、`/bin/sh`、含 GLIBC 版本标记的 soname 等）自动丢弃。deb 的 `Recommends` 转 `optdepends`，`Breaks` 并入 `conflicts`，rpm 的 `Obsoletes` 转 `replaces`，版本约束符号（`<<`/`>>`/`>=` 等）逐一映射为 pacman 语法。
+Untranslatable dependencies are dropped by default and summarized at the end (`-k` keeps them). Distro-infrastructure deps (`debconf`, `dpkg`, `rpmlib(...)`, `config(...)`, `/bin/sh`, GLIBC-versioned sonames …) are pruned automatically. deb `Recommends` becomes `optdepends`, `Breaks` merges into `conflicts`, rpm `Obsoletes` becomes `replaces`; version operators (`<<`/`>>`/`>=` …) are mapped to pacman syntax one by one.
 
-**维护脚本移植**：deb 脚本会注入 `set -- configure/install/...` 模拟 Debian 参数语义；rpm 脚本按 `$1 = 1/2/0` 模拟安装/升级/卸载；`%post -p /sbin/ldconfig` 自动转成 `ldconfig` 调用；alpine 的 6 种脚本与 pacman 语义一一对应。
+**Install script porting**: deb scripts get `set -- configure/install/...` to emulate Debian argument semantics; rpm scripts emulate install/upgrade/erase via `$1 = 1/2/0`; `%post -p /sbin/ldconfig` becomes a plain `ldconfig` call; alpine's 6 script types map 1:1 onto pacman's.
 
-## 已知局限
+## Known limitations
 
-- 转换不保证语义 100% 等价：维护脚本参数语义为近似模拟，`pre/posttrans` 无 pacman 等价物（自动忽略并告警）；
-- RPM 的范围依赖（`<>`）在 pacman 中降级为无版本依赖；
-- 极新/冷门依赖名可能翻译失败，请查 `alltap-report.txt` 并按需手工补包或向 `data/dep-map.conf` 提交规则；
-- 未经审计的第三方包存在安全风险，安装前建议 `pacman -Qlp` 检查内容。
+- Conversion is not 100% semantically equivalent: script argument semantics are emulated; `pre/posttrans` has no pacman equivalent (ignored with a warning);
+- RPM range dependencies (`<>`) degrade to unversioned deps;
+- Bleeding-edge or niche dep names may fail to translate — check `alltap-report.txt` and add rules to `data/dep-map.conf`;
+- Unaudited third-party packages are a security risk — inspect with `pacman -Qlp` before installing.
 
-## 开发与测试
+## Development & testing
 
 ```bash
-bash tests/run-tests.sh          # 转换回归: 7 种格式 + PKGBUILD + 重打包 (10/10)
-bash tests/test-install-mock.sh  # 安装闭环 mock 测试: 10 个场景 (含多包事务/AUR/dry-run)
-bash tests/test-install-real.sh  # 真实 pacman 隔离测试 (unshare + 临时 root, 6/6)
-python3 tests/build-fixtures.py  # 单独重建全部测试样例 (13 个)
+bash tests/run-tests.sh          # conversion regression: 7 formats + PKGBUILD + repack (10/10)
+bash tests/test-install-mock.sh  # install-loop mock tests: 10 scenarios (multi-pkg/AUR/dry-run incl.)
+bash tests/test-install-real.sh  # real-pacman isolated tests (unshare + throwaway root, 6/6)
+python3 tests/build-fixtures.py  # rebuild all test fixtures (13)
 ```
 
-测试样例均为程序化构造（含手工构造的合法 RPM/cpio 流、ar 归档、.PKGINFO），外加 Fedora 官方仓库下载的真实 hello RPM。
+All fixtures are generated programmatically (hand-crafted valid RPM/cpio streams, ar archives, `.PKGINFO`), plus a real hello RPM downloaded from the official Fedora repository.
 
-mock 测试覆盖场景：未知依赖自动移除（A）、仓库依赖补装（B）、文件冲突精确覆盖（C）、`--no-autodeps`（D）、`--no-overwrite`（E）、重试上限（F）、**多包事务同批依赖互满足（G）**、**AUR 兜底补装（H）**、**`--dry-run` 计划输出且不安装（I）**、**`--dry-run` 文件冲突预检（J）**；真实 pacman 测试另含**多包互赖单事务安装**与 **dry-run 不落地**验证；AUR 依赖在 AUR 与 yay/paru 均有的条件下才会真正安装。
+CI runs all three suites on every push — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-## 与 debtap 的差异
+## Differences vs. debtap
 
 | | debtap | alltap |
 |---|---|---|
-| 支持格式 | 仅 .deb | deb/rpm/apk/tgz/AppImage/tarball/archpkg |
-| RPM 解析 | ✗ | 纯 Python（零外部依赖，支持 zstd payload） |
-| 打包 | 交互式 + makepkg | 一键直出（makepkg 等价构造）+ `-p` 模式 |
-| 依赖数据库 | 手动 `-u` 联网更新 | 本地 pacman 仓库 + 内置映射，免联网 |
-| 交互性 | 每个包多次问答 | 默认无交互，`-k`/`--no-scripts` 可控 |
-| 安装体验 | 无 | 多包单事务 `-i` + AUR 兜底 `--aur` + 预演 `--dry-run` |
+| Formats | .deb only | deb/rpm/apk/tgz/AppImage/tarball/archpkg |
+| RPM parsing | ✗ | pure Python (zero deps, zstd payload support) |
+| Packaging | interactive + makepkg | one-shot build (makepkg-equivalent) + `-p` mode |
+| Dep database | manual `-u` online update | local pacman repos + built-in mappings, offline |
+| Interactivity | multiple prompts per package | none by default; `-k`/`--no-scripts` available |
+| Install | ✗ | multi-package transaction `-i` + AUR fallback `--aur` + rehearsal `--dry-run` |
 
-## 许可
+## License
 
 GPL-3.0-or-later

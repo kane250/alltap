@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Test suite (Arch Linux)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Sy --noconfirm --needed python libarchive zstd
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Conversion regression (7 formats + PKGBUILD + repack)
+        run: bash tests/run-tests.sh
+
+      - name: Install-loop mock tests (10 scenarios)
+        run: bash tests/test-install-mock.sh
+
+      - name: Real-pacman isolated tests (unshare or root fallback)
+        run: bash tests/test-install-real.sh
