@@ -38,18 +38,26 @@ run tests/fixtures/topdir-usr-tree.tar.gz              myapp
 # PKGBUILD 模式
 # makepkg 拒绝以 root 运行; 在 CI 容器 (默认 root) 中降权到 nobody 执行
 mkpkg() {
-    local d="$1"
+    local d="$1" rc
     if [ "$(id -u)" = "0" ]; then
         chown -R nobody: "$d" 2>/dev/null || chmod -R a+rwX "$d"
-        ( cd "$d" && runuser -u nobody -- env HOME=/tmp makepkg -f -d > /dev/null 2>&1 )
+        ( cd "$d" && runuser -u nobody -- env HOME=/tmp makepkg -f -d > "$OUT/makepkg.log" 2>&1 )
+        rc=$?
     else
-        ( cd "$d" && makepkg -f -d > /dev/null 2>&1 )
+        ( cd "$d" && makepkg -f -d > "$OUT/makepkg.log" 2>&1 )
+        rc=$?
     fi
+    if [ "$rc" != 0 ]; then
+        echo "---- makepkg 失败日志 (uid=$(id -u)) ----"
+        tail -30 "$OUT/makepkg.log"
+        echo "------------------------------------------"
+    fi
+    return $rc
 }
 rm -rf "$OUT/pbmode"
 if ./alltap tests/fixtures/alltapdemo_1.4-2ubuntu1_amd64.deb -o "$OUT/pbmode" -p -q 2>/dev/null \
    && [ -f "$OUT/pbmode/alltapdemo/PKGBUILD" ]; then
-    mkpkg "$OUT/pbmode/alltapdemo"
+    mkpkg "$OUT/pbmode/alltapdemo" || true
     if ls "$OUT/pbmode/alltapmode"/*.pkg.tar.zst > /dev/null 2>&1; then :; fi
     if ls "$OUT/pbmode/alltapdemo"/*.pkg.tar.zst > /dev/null 2>&1 \
        && pacman -Qp "$OUT/pbmode/alltapdemo"/*.pkg.tar.zst > /dev/null 2>&1; then
