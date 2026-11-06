@@ -1,6 +1,6 @@
 # alltap 本体安装 PKGBUILD
 pkgname=alltap
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="把 (几乎) 所有 Linux 软件包转换成 Arch Linux 软件包 — debtap 的全格式继任者"
 arch=('any')
