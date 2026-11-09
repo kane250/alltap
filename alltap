@@ -14,8 +14,9 @@ alltap — 把 (几乎) 所有 Linux 软件包转换成 Arch Linux 软件包
   .pkg.tar.zst  Arch 包本身 (重打包 & 元数据修正)
 
 输出:
-  默认:  直接生成可 pacman -U 安装的 .pkg.tar.zst
-  -p :   仅生成 PKGBUILD (debtap 兼容模式)
+  默认:  直接生成可 pacman -U 安装的 .pkg.tar.zst (平铺到 -o 目录, 不建子目录)
+         交互终端下转换完成后询问是否安装; -i 直接安装, --no-prompt 只转换
+  -p :   仅生成 PKGBUILD (debtap 兼容模式, 同样平铺输出)
 
 外部依赖: python3 >= 3.9, bsdtar (libarchive), zstd/xz/bzip2/gzip (按需)
 
@@ -2995,6 +2996,26 @@ def handle_unknown_deps(specs, names, opts):
     return "abort", []
 
 
+def confirm_install(specs):
+    """转换完成后询问是否安装; 返回 True 表示用户同意.
+
+    只在交互终端下调用 (main 已判断 stdin 是 TTY), 因此这里直接读一行输入.
+    回车 / EOF / Ctrl-C 都按"不安装"处理, 避免误装.
+
+    Ask whether to install the freshly built packages; True means yes.
+
+    Only called on an interactive terminal (main checks stdin.isatty()), so a plain
+    line read is fine. Empty input, EOF and Ctrl-C all mean "do not install".
+    """
+    names = ", ".join(sp.meta.name for sp in specs)
+    try:
+        ans = input(f"\n是否安装以上 {len(specs)} 个包 ({names})? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return ans in ("y", "yes", "是")
+
+
 # ---------------------------------------------------------------------------
 # 安装事务: 一次 pacman -U 装全部包, 失败诊断修复后整批重试
 # install transaction: one pacman -U for all packages, diagnose failures, repair, then retry the
@@ -3433,21 +3454,23 @@ def convert_one(path: str, opts) -> Optional[str]:
 
     返回值有三种可能, 调用方 (main) 需区分:
       * None      失败/跳过 (已打印原因)
-      * PKGSpec   -i 或 --dry-run 模式, 需要参与后续安装事务
+      * PKGSpec   -i / --dry-run / 交互询问模式, 需要参与后续安装事务
       * str       成品包或 PKGBUILD 的路径
 
     work 目录的生命周期: 普通模式与 -p 模式在本函数末尾清理;
-    -i/--dry-run 保留给修复循环重打包用, 由 main 在事务结束后 finally 统一清理.
+    -i / --dry-run / 交互询问模式保留给修复循环重打包用, 由 main 在事务结束后统一清理.
 
     Convert a single package file.
 
     Three possible return values, distinguished by main:
       * None       failed/skipped (reason already printed)
-      * PKGSpec    -i or --dry-run mode; participates in the install transaction
+      * PKGSpec    -i / --dry-run / interactive-prompt mode; participates in the install
+                   transaction
       * str        path to the built package or PKGBUILD
 
     work lifetime: normal and -p modes clean it at the end of this function;
-    -i/--dry-run keeps it for repackaging and main cleans it in a finally block.
+    -i / --dry-run / interactive-prompt keep it for repackaging and main cleans it up
+    after the transaction.
     """
     log.info(f"\n==> 转换: {os.path.basename(path)}")
     opts.translator.reset()
@@ -3497,14 +3520,17 @@ def convert_one(path: str, opts) -> Optional[str]:
         verb = "已保留, 交由安装判定" if opts.keep_unknown_deps else "已剔除"
         print(f"  注意: 未识别依赖({verb}): {', '.join(sorted(set(tr.unresolved)))}")
 
-    outdir = os.path.join(opts.output, meta.name)
-    if os.path.exists(outdir):
-        if opts.force:
-            shutil.rmtree(outdir)
-        else:
-            log.warn(f"输出目录已存在: {outdir}, 跳过 (--force 可覆盖)")
-            return None
+    # 输出直接平铺到目标目录, 不再为每个包建 <pkgname>/ 子目录
+    # flat output: write straight into the target directory, no per-package subdirectory
+    outdir = opts.output
     os.makedirs(outdir, exist_ok=True)
+
+    # 目标文件已存在时保持旧的覆盖策略: 默认跳过, 只有 -f 才覆盖
+    # keep the previous overwrite policy: skip by default, only -f overwrites
+    target = os.path.join(outdir, "PKGBUILD" if opts.pkgbuild else meta.pkgfilename)
+    if os.path.exists(target) and not opts.force:
+        log.warn(f"输出文件已存在: {target}, 跳过 (--force 可覆盖)")
+        return None
 
     if opts.pkgbuild:
         # PKGBUILD 模式: 原包复制到目录里, 附带 .install 脚本
@@ -3513,7 +3539,11 @@ def convert_one(path: str, opts) -> Optional[str]:
         # script
         # note: the original package is copied under its filename; PKGBUILD source/noextract refer
         # to the same name.
-        shutil.copy2(path, os.path.join(outdir, os.path.basename(path)))
+        # 平铺输出时源包可能就在目标目录里, 同文件复制会抛 SameFileError
+        # with flat output the source package may already live in the target directory
+        dst = os.path.join(outdir, os.path.basename(path))
+        if os.path.abspath(dst) != os.path.abspath(path):
+            shutil.copy2(path, dst)
         if meta.scripts and "__raw__" not in meta.scripts:
             wanted = [k for k in ("pre_install", "post_install", "pre_upgrade",
                                   "post_upgrade", "pre_remove", "post_remove") if k in meta.scripts]
@@ -3541,7 +3571,9 @@ def convert_one(path: str, opts) -> Optional[str]:
     # 翻译记录 (安装事务模式下同样保留, 便于事后审计)
     # translation report (also kept in install-transaction mode for later audit)
     if tr.translated or tr.unresolved:
-        with open(os.path.join(outdir, "alltap-report.txt"), "w", encoding="utf8") as f:
+        # 平铺输出下报告按包名区分, 避免多包互相覆盖
+        # with flat output the report is named per package so batches do not overwrite each other
+        with open(os.path.join(outdir, f"alltap-report-{meta.name}.txt"), "w", encoding="utf8") as f:
             f.write(f"source: {os.path.basename(path)}\nformat: {fmt}\n")
             f.write(f"pkg: {meta.name} {meta.fullver}\n\n[翻译成功的依赖]\n")
             f.write("\n".join(tr.translated) + "\n\n[未识别的依赖")
@@ -3550,7 +3582,7 @@ def convert_one(path: str, opts) -> Optional[str]:
 
     # 安装预演 / 安装事务模式: 返回 PKGSpec, work 由主流程统一清理
     # install preview / transaction mode: return PKGSpec; main cleans up work afterwards
-    if opts.install or opts.dry_run:
+    if opts.install or opts.dry_run or getattr(opts, "prompt_install", False):
         return PKGSpec(meta, tree_dir, outdir, work, pkgpath, fmt, path)
 
     shutil.rmtree(work, ignore_errors=True)
@@ -3609,8 +3641,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  alltap package.deb                  # 转出可安装的 .pkg.tar.zst
+  alltap package.deb                  # 转换完成后询问是否安装
   alltap package.rpm -o ~/pkgs        # 指定输出目录
+  alltap package.deb --no-prompt      # 只转换, 不询问安装
   alltap package.deb -p               # 只生成 PKGBUILD (debtap 兼容)
   alltap program.AppImage -n prog     # AppImage 重打包
   alltap a.deb b.rpm -i               # 多包单事务安装 (依赖互相满足)
@@ -3620,7 +3653,8 @@ def main():
 """)
     ap.add_argument("packages", nargs="*", help="待转换的包文件 (可多个)")
     ap.add_argument("-p", "--pkgbuild", action="store_true", help="仅生成 PKGBUILD, 不直接打包")
-    ap.add_argument("-o", "--output", default=".", help="输出目录 (默认当前目录)")
+    ap.add_argument("-o", "--output", default=".",
+                    help="输出目录 (默认当前目录; 文件直接平铺, 不建 <包名>/ 子目录)")
     ap.add_argument("-n", "--name", help="覆盖包名")
     ap.add_argument("-d", "--desc", dest="desc", help="覆盖描述")
     ap.add_argument("-u", "--url", help="覆盖主页")
@@ -3633,7 +3667,9 @@ def main():
                     help="无法翻译的依赖保持原名保留 (默认剔除)")
     ap.add_argument("--no-scripts", action="store_true", help="不移植安装/卸载脚本")
     ap.add_argument("-i", "--install", action="store_true",
-                    help="转换后自动 pacman -U 安装 (多包为单事务, 依赖互相满足); 失败自动修复重试")
+                    help="转换后直接 pacman -U 安装, 不再询问 (多包为单事务, 依赖互相满足); 失败自动修复重试")
+    ap.add_argument("--no-prompt", action="store_true",
+                    help="转换后不询问是否安装 (非交互环境默认就不询问)")
     ap.add_argument("--aur", action="store_true",
                     help="仓库缺失依赖时查询 AUR, 征得同意后用 yay/paru 补装 (需已安装其一)")
     ap.add_argument("--dry-run", action="store_true",
@@ -3643,7 +3679,7 @@ def main():
                     help="自动确认: 补装依赖 / 移除未知依赖 / 精确覆盖冲突文件")
     ap.add_argument("--no-autodeps", action="store_true", help="禁止自动补装仓库内缺失依赖")
     ap.add_argument("--no-overwrite", action="store_true", help="禁止自动处理文件冲突")
-    ap.add_argument("-f", "--force", action="store_true", help="覆盖已有输出目录")
+    ap.add_argument("-f", "--force", action="store_true", help="覆盖已存在的输出文件")
     ap.add_argument("--refresh", action="store_true", help="刷新 Arch 仓库包名缓存后退出")
     ap.add_argument("-V", "--version", "--show-version", dest="show_version",
                     action="store_true", help="显示 alltap 版本")
@@ -3653,6 +3689,13 @@ def main():
 
     log.quiet = args.quiet
     log.verbose = args.verbose
+
+    # 交互式安装询问: 默认整批转换完成后问一次;
+    # 非 TTY / 安静模式 / -i / --dry-run / --no-prompt 都不问.
+    # interactive install prompt: asked once after the whole batch by default;
+    # skipped on non-TTY, quiet mode, -i, --dry-run and --no-prompt.
+    args.prompt_install = (not args.install and not args.dry_run and not args.no_prompt
+                           and not args.quiet and sys.stdin.isatty())
 
     if args.show_version:
         print(f"{PROG} {VERSION}")
@@ -3668,6 +3711,8 @@ def main():
     if not args.packages:
         ap.print_help()
         return 1
+    if args.pkgbuild and len(args.packages) > 1:
+        log.warn("-p 模式输出平铺到同一目录, 多包会互相覆盖 PKGBUILD; 建议一次只转一个包")
 
     for p in args.packages:
         if not os.path.exists(p):
@@ -3721,10 +3766,15 @@ def main():
     # clean up the temporary directory regardless of success (finally), because the built packages
     # are already in outdir.
     if specs:
+        do_install = args.install
+        if not do_install and not args.dry_run and args.prompt_install:
+            do_install = confirm_install(specs)
+            if not do_install:
+                print("  已跳过安装; 成品包已保留, 之后可用 sudo pacman -U 手动安装")
         try:
             if args.dry_run:
                 dry_run_report(specs, PacmanRunner(args), args)
-            else:
+            elif do_install:
                 ok_install = install_transaction(specs, args)
                 if not ok_install:
                     log.warn("安装事务未成功; 成品包与报告已保留, 可手动处理 (-U 手动安装)")

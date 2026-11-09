@@ -40,6 +40,7 @@ alltap foo-1.0-x86_64-1.txz           # Slackware 包
 alltap CoolApp-2.5.AppImage -n coolapp # AppImage 重打包到 /opt/coolapp
 alltap bundle-2.1.tar.xz              # 通用归档 (自动判定系统树/二进制归档)
 alltap a.deb b.rpm c.apk              # 批量
+alltap package.deb --no-prompt        # 只转换, 不询问安装
 alltap package.deb -p                 # 仅生成 PKGBUILD (debtap 兼容模式)
 alltap package.deb -o ~/pkgs          # 指定输出目录
 alltap program.rpm -k                 # 保留无法翻译的依赖原名
@@ -52,20 +53,21 @@ alltap --version                      # 显示 alltap 版本 (-V 等价)
 alltap --refresh                      # 刷新 Arch 仓库包名缓存
 ```
 
-输出目录结构：
+输出直接平铺在 `-o` 目录（默认当前目录），不再为每个包建 `<pkgname>/` 子目录：
 
 ```
-<pkgname>/
-  ├── <pkgname>-<ver>-<rel>-<arch>.pkg.tar.zst   # 成品包
-  └── alltap-report.txt                           # 依赖翻译记录
-alltap-plan.txt                                   # (--dry-run 时) 安装计划, 位于输出目录
+<pkgname>-<ver>-<rel>-<arch>.pkg.tar.zst   # 成品包
+alltap-report-<pkgname>.txt                # 依赖翻译记录
+alltap-plan.txt                            # (--dry-run 时) 安装计划
 ```
+
+同包重复转换默认跳过（提示已存在），`-f` 覆盖。
 
 成品包按 makepkg 等价流程构造（`.PKGINFO` + `.MTREE` + 可选 `.INSTALL`，GNU tar 格式 + zstd 压缩，文件归一化为 root 归属），`pacman -U` 直接安装。
 
 ## 安装自愈闭环（`-i`）
 
-转换只是第一步——第三方包装不上，多半卡在依赖与文件冲突。`-i` 让 alltap 转换后直接 `pacman -U` 并按失败原因自动修复、循环重试。**多包时为单一事务**：一次 `pacman -U app1.pkg app2.pkg ...`，同批包之间的互相依赖由 pacman 同事务自动满足，避免逐包安装时"A 依赖 B 而 B 尚未装"的顺序性失败：
+转换只是第一步——第三方包装不上，多半卡在依赖与文件冲突。缺省行为是：**先转换，完成后询问「是否安装？」**（仅在交互终端询问；管道、脚本、`-q` 自动跳过，回车即放弃）。`-i` 表示跳过询问直接安装，并按失败原因自动修复、循环重试。**多包时为单一事务**：一次 `pacman -U app1.pkg app2.pkg ...`，同批包之间的互相依赖由 pacman 同事务自动满足，避免逐包安装时"A 依赖 B 而 B 尚未装"的顺序性失败：
 
 ```
 解包+解析 ──▶ 依赖映射 ──▶ .pkg.tar.zst ────▶ pacman -U (多包单事务)
@@ -121,7 +123,7 @@ alltap foo.deb -i --dry-run        # 只输出安装计划, 不实际执行
 
 - `-i` / `--dry-run` 模式会自动**保留未识别依赖的原名**（普通转换模式才默认剔除），否则安装闭环无从判定；翻译失败的依赖会原样送交 pacman 判定。
 - 需要 root：以 root 运行时直接执行；普通用户优先 `sudo -n`（免密），否则用 `pkexec` 图形认证弹窗；`-T`/`-Si` 等只读查询不提权。
-- 所有 pacman 调用强制 `LC_ALL=C` 解析英文输出；重试上限后停止，已生成的包文件与 `alltap-report.txt` 完整保留。
+- 所有 pacman 调用强制 `LC_ALL=C` 解析英文输出；重试上限后停止，已生成的包文件与 `alltap-report-<pkgname>.txt` 完整保留。
 - 测试用隔离通道（不影响正常使用）：`ALLTAP_PACMAN`（替换 pacman 可执行）、`ALLTAP_PACMAN_ROOT`（`--root` 隔离根）、`ALLTAP_PACMAN_EXTRA`（附加参数）、`ALLTAP_NO_SUDO=1`（跳过提权）、`ALLTAP_AUR_RPC`（AUR RPC URL 模板，`{name}` 占位，`file://` 可离线 mock）、`ALLTAP_AUR_HELPER`（替换 yay/paru 命令）。
 
 ## 依赖翻译原理
@@ -140,13 +142,13 @@ alltap foo.deb -i --dry-run        # 只输出安装计划, 不实际执行
 
 - 转换不保证语义 100% 等价：维护脚本参数语义为近似模拟，`pre/posttrans` 无 pacman 等价物（自动忽略并告警）；
 - RPM 的范围依赖（`<>`）在 pacman 中降级为无版本依赖；
-- 极新/冷门依赖名可能翻译失败，请查 `alltap-report.txt` 并按需手工补包或向 `data/dep-map.conf` 提交规则；
+- 极新/冷门依赖名可能翻译失败，请查 `alltap-report-<pkgname>.txt` 并按需手工补包或向 `data/dep-map.conf` 提交规则；
 - 未经审计的第三方包存在安全风险，安装前建议 `pacman -Qlp` 检查内容。
 
 ## 开发与测试
 
 ```bash
-bash tests/run-tests.sh          # 转换回归: 7 种格式 + PKGBUILD + 重打包 + 4 项 P1 回归 (14/14)
+bash tests/run-tests.sh          # 转换回归: 7 种格式 + PKGBUILD + 重打包 + 6 项回归 (16/16)
 bash tests/test-install-mock.sh  # 安装闭环 mock 测试: 10 个场景 (含多包事务/AUR/dry-run)
 bash tests/test-install-real.sh  # 真实 pacman 隔离测试 (unshare + 临时 root, 6/6)
 python3 tests/build-fixtures.py  # 单独重建全部测试样例 (16 个)

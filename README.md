@@ -40,6 +40,7 @@ alltap foo-1.0-x86_64-1.txz           # Slackware package
 alltap CoolApp-2.5.AppImage -n coolapp # AppImage repacked into /opt/coolapp
 alltap bundle-2.1.tar.xz              # generic archive (auto-detects system tree vs. binary bundle)
 alltap a.deb b.rpm c.apk              # batch conversion
+alltap package.deb --no-prompt        # convert only, never ask to install
 alltap package.deb -p                 # PKGBUILD only (debtap-compatible mode)
 alltap package.deb -o ~/pkgs          # custom output directory
 alltap program.rpm -k                 # keep untranslatable deps verbatim
@@ -52,14 +53,16 @@ alltap --version                      # show alltap version (= -V)
 alltap --refresh                      # refresh the Arch repo package-name cache
 ```
 
-Output layout:
+Output is written flat into the `-o` directory (current directory by default); there is no
+per-package `<pkgname>/` subdirectory:
 
 ```
-<pkgname>/
-  ├── <pkgname>-<ver>-<rel>-<arch>.pkg.tar.zst   # the resulting package
-  └── alltap-report.txt                           # dependency translation report
-alltap-plan.txt                                   # install plan (with --dry-run), in the output dir
+<pkgname>-<ver>-<rel>-<arch>.pkg.tar.zst   # the resulting package
+alltap-report-<pkgname>.txt                # dependency translation report
+alltap-plan.txt                            # install plan (with --dry-run)
 ```
+
+Re-converting the same package is skipped with a notice unless `-f` is given.
 
 Every package is built through a makepkg-equivalent pipeline (`.PKGINFO` + `.MTREE` + optional `.INSTALL`, GNU tar format + zstd compression, ownership normalized to root), directly installable via `pacman -U`.
 
@@ -121,7 +124,7 @@ Notes:
 
 - `-i` / `--dry-run` automatically **keep untranslatable dependencies verbatim** (plain conversion drops them), so that pacman can judge repository availability and drive the repair loop.
 - Root required for installs: runs directly as root; normal users escalate via non-interactive `sudo -n`, then `pkexec`. Read-only queries (`-T`/`-Si`) never escalate.
-- All pacman invocations run under `LC_ALL=C` for stable output parsing; after exhausting retries, generated packages and `alltap-report.txt` are preserved.
+- All pacman invocations run under `LC_ALL=C` for stable output parsing; after exhausting retries, generated packages and `alltap-report-<pkgname>.txt` are preserved.
 - Test-only environment channels: `ALLTAP_PACMAN` (override pacman binary), `ALLTAP_PACMAN_ROOT` (`--root` isolated root), `ALLTAP_PACMAN_EXTRA` (extra args), `ALLTAP_NO_SUDO=1` (skip escalation), `ALLTAP_AUR_RPC` (AUR RPC URL template with `{name}` placeholder, supports `file://` for offline mocking), `ALLTAP_AUR_HELPER` (override yay/paru command).
 
 ## How dependency translation works
@@ -140,13 +143,13 @@ Untranslatable dependencies are dropped by default and summarized at the end (`-
 
 - Conversion is not 100% semantically equivalent: script argument semantics are emulated; `pre/posttrans` has no pacman equivalent (ignored with a warning);
 - RPM range dependencies (`<>`) degrade to unversioned deps;
-- Bleeding-edge or niche dep names may fail to translate — check `alltap-report.txt` and add rules to `data/dep-map.conf`;
+- Bleeding-edge or niche dep names may fail to translate — check `alltap-report-<pkgname>.txt` and add rules to `data/dep-map.conf`;
 - Unaudited third-party packages are a security risk — inspect with `pacman -Qlp` before installing.
 
 ## Development & testing
 
 ```bash
-bash tests/run-tests.sh          # conversion regression: 7 formats + PKGBUILD + repack + 4 P1 regressions (14/14)
+bash tests/run-tests.sh          # conversion regression: 7 formats + PKGBUILD + repack + 6 regressions (16/16)
 bash tests/test-install-mock.sh  # install-loop mock tests: 10 scenarios (multi-pkg/AUR/dry-run incl.)
 bash tests/test-install-real.sh  # real-pacman isolated tests (unshare + throwaway root, 6/6)
 python3 tests/build-fixtures.py  # rebuild all test fixtures (16)

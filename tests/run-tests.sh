@@ -13,7 +13,7 @@ python3 tests/build-fixtures.py > /dev/null || { echo "✗ fixtures 生成失败
 run() {  # run <fixture路径> <期望包名>
     local fixture="$1" want="$2"
     rm -rf "$OUT/$want"
-    if ! ./alltap "$fixture" -o "$OUT" -q 2>/dev/null; then
+    if ! ./alltap "$fixture" -o "$OUT/$want" -q 2>/dev/null; then
         echo "✗ $want 转换失败"; FAIL=$((FAIL+1)); return
     fi
     local pkg
@@ -51,7 +51,7 @@ mkpkg_srcinfo() {
 # ---- P1 回归 ----
 # 1) 顶层目录本身就是 usr/ 时不得被当作包装层剥掉
 rm -rf "$OUT/usrdemo"
-if ./alltap tests/fixtures/usr-tree.tar.gz -n usrdemo -o "$OUT" -q 2>/dev/null \
+if ./alltap tests/fixtures/usr-tree.tar.gz -n usrdemo -o "$OUT/usrdemo" -q 2>/dev/null \
    && bsdtar -tf "$OUT/usrdemo/"*.pkg.tar.zst 2>/dev/null | grep -qx 'usr/bin/usrdemo'; then
     echo "✓ tarball 顶层 usr/ 路径保留"; PASS=$((PASS+1))
 else
@@ -61,7 +61,7 @@ fi
 # 2) 无系统树 + 自定义 prefix 不得出现 "move into itself"
 rm -rf "$OUT/plaindemo"
 if ./alltap tests/fixtures/plain-tree.tar.gz -n plaindemo \
-      --prefix '/usr/local/{pkgname}' -o "$OUT" -q 2>/dev/null \
+      --prefix '/usr/local/{pkgname}' -o "$OUT/plaindemo" -q 2>/dev/null \
    && bsdtar -tf "$OUT/plaindemo/"*.pkg.tar.zst 2>/dev/null | grep -qx 'usr/local/plaindemo/readme.txt'; then
     echo "✓ tarball 自定义 prefix 安装路径正确"; PASS=$((PASS+1))
 else
@@ -71,10 +71,10 @@ fi
 # 3) 带 epoch 的包: PKGBUILD 必须用独立 epoch 变量, pkgver 不得含冒号
 rm -rf "$OUT/epochpb"
 if ./alltap tests/fixtures/epochdemo_2.0-3_amd64.deb -o "$OUT/epochpb" -p -q 2>/dev/null \
-   && grep -qx "epoch='1'" "$OUT/epochpb/epochdemo/PKGBUILD" \
-   && grep -qx "pkgver='2.0'" "$OUT/epochpb/epochdemo/PKGBUILD" \
-   && grep -qx "options=('!strip' '!debug')" "$OUT/epochpb/epochdemo/PKGBUILD" \
-   && mkpkg_srcinfo "$OUT/epochpb/epochdemo"; then
+   && grep -qx "epoch='1'" "$OUT/epochpb/PKGBUILD" \
+   && grep -qx "pkgver='2.0'" "$OUT/epochpb/PKGBUILD" \
+   && grep -qx "options=('!strip' '!debug')" "$OUT/epochpb/PKGBUILD" \
+   && mkpkg_srcinfo "$OUT/epochpb"; then
     echo "✓ PKGBUILD epoch/options 正确且通过 makepkg 校验"; PASS=$((PASS+1))
 else
     echo "✗ PKGBUILD epoch 处理失败"; FAIL=$((FAIL+1))
@@ -84,7 +84,7 @@ fi
 rm -rf "$OUT/appipb"
 if ./alltap tests/fixtures/CoolApp-2.5.AppImage -n coolapp \
       --prefix '/opt/custom/{pkgname}' -o "$OUT/appipb" -p -q 2>/dev/null \
-   && grep -q '/opt/custom/coolapp/coolapp.AppImage' "$OUT/appipb/coolapp/PKGBUILD"; then
+   && grep -q '/opt/custom/coolapp/coolapp.AppImage' "$OUT/appipb/PKGBUILD"; then
     echo "✓ PKGBUILD AppImage 前缀生效"; PASS=$((PASS+1))
 else
     echo "✗ PKGBUILD AppImage 前缀未生效"; FAIL=$((FAIL+1))
@@ -111,24 +111,41 @@ mkpkg() {
 }
 rm -rf "$OUT/pbmode"
 if ./alltap tests/fixtures/alltapdemo_1.4-2ubuntu1_amd64.deb -o "$OUT/pbmode" -p -q 2>/dev/null \
-   && [ -f "$OUT/pbmode/alltapdemo/PKGBUILD" ]; then
-    mkpkg "$OUT/pbmode/alltapdemo" || true
-    if ls "$OUT/pbmode/alltapmode"/*.pkg.tar.zst > /dev/null 2>&1; then :; fi
-    if ls "$OUT/pbmode/alltapdemo"/*.pkg.tar.zst > /dev/null 2>&1 \
-       && pacman -Qp "$OUT/pbmode/alltapdemo"/*.pkg.tar.zst > /dev/null 2>&1; then
+   && [ -f "$OUT/pbmode/PKGBUILD" ]; then
+    mkpkg "$OUT/pbmode" || true
+    if ls "$OUT/pbmode"/*.pkg.tar.zst > /dev/null 2>&1 \
+       && pacman -Qp "$OUT/pbmode"/*.pkg.tar.zst > /dev/null 2>&1; then
         echo "✓ PKGBUILD 模式 (makepkg 可打包)"; PASS=$((PASS+1))
     else
         echo "✗ PKGBUILD 模式 makepkg 失败"; FAIL=$((FAIL+1))
     fi
-    rm -f "$OUT/pbmode/alltapdemo"/*.pkg.tar.zst
+    rm -f "$OUT/pbmode"/*.pkg.tar.zst
 else
     echo "✗ PKGBUILD 生成失败"; FAIL=$((FAIL+1))
+fi
+
+# 输出平铺: 不在 -o 目录下再建 <包名>/ 子目录
+rm -rf "$OUT/flat"
+if ./alltap tests/fixtures/helloworld-1.0.tar.gz -o "$OUT/flat" -q 2>/dev/null \
+   && [ -f "$OUT/flat/helloworld-1.0-1-any.pkg.tar.zst" ] \
+   && [ ! -d "$OUT/flat/helloworld" ]; then
+    echo "✓ 输出平铺 (不建 <包名>/ 子目录)"; PASS=$((PASS+1))
+else
+    echo "✗ 输出仍然建了子目录"; FAIL=$((FAIL+1))
+fi
+
+# 非交互环境 (stdin 非 TTY) 不得弹出安装询问
+rm -rf "$OUT/flat2"
+if ./alltap tests/fixtures/helloworld-1.0.tar.gz -o "$OUT/flat2" 2>/dev/null | grep -q '是否安装'; then
+    echo "✗ 非交互环境弹出了安装询问"; FAIL=$((FAIL+1))
+else
+    echo "✓ 非交互环境不询问安装"; PASS=$((PASS+1))
 fi
 
 # Arch 包重打包
 firstpkg=$(ls "$OUT/alltapdemo/"*.pkg.tar.zst | head -1)
 if ./alltap "$firstpkg" -o "$OUT/repack" -q 2>/dev/null \
-   && pacman -Qp "$OUT/repack/alltapdemo/"*.pkg.tar.zst > /dev/null 2>&1; then
+   && pacman -Qp "$OUT/repack/"*.pkg.tar.zst > /dev/null 2>&1; then
     echo "✓ Arch 包重打包"; PASS=$((PASS+1))
 else
     echo "✗ Arch 包重打包失败"; FAIL=$((FAIL+1))
