@@ -10,6 +10,6 @@ pkgbase = alltap
 	depends = zstd
 	optdepends = pacman: 本地仓库匹配与安装支持
 	source = https://github.com/kane250/alltap/releases/download/v1.2.1/alltap-1.2.1.tar.gz
-	sha256sums = 8278c311fb2125e3d16c846d0f63ef2c73cae9d1871e7e3913e7430ce83bdf50
+	sha256sums = a36b086b910252f37d07fb0c3e54009f1e9e38147b265ece9c50306fd8832602
 
 pkgname = alltap
