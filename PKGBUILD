@@ -5,7 +5,7 @@
 #       (subdirectories are flattened), so dep-map.conf and LICENSE are
 #       installed straight from their repository paths instead of `source`.
 pkgname=alltap
-pkgver=1.2.1
+pkgver=1.3.0
 pkgrel=1
 pkgdesc="把 (几乎) 所有 Linux 软件包转换成 Arch Linux 软件包 — debtap 的全格式继任者"
 arch=('any')
