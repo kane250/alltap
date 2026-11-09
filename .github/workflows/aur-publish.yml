@@ -8,7 +8,7 @@ on:
       commit_message:
         description: "AUR 提交说明"
         required: false
-        default: "alltap 1.2.0-1"
+        default: "alltap 1.2.1-1"
 
 jobs:
   publish:
