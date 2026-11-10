@@ -13,8 +13,5 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
-# AUR 部署密钥 (本地保管, 绝不入库)
-.aur-deploy-key*
-
 # 本地临时/探测工作区
 .temp/
