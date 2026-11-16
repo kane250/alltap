@@ -12,7 +12,6 @@ arch=('any')
 url="https://github.com/kane250/alltap"
 license=('GPL')
 depends=('python' 'libarchive' 'zstd')
-optdepends=('pacman: 用于本地仓库包名匹配与安装')
 source=('alltap'
         'README.md')
 md5sums=('SKIP' 'SKIP')
