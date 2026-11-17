@@ -3067,6 +3067,9 @@ def install_transaction(specs, opts):
             if cross:
                 log.info(f"    依赖 {', '.join(cross)} 由同批包提供 (同一事务自动满足)")
 
+    # 安装事务计时: 每轮尝试与整个事务都报告耗时
+    # install-transaction timing: each attempt and the whole transaction report elapsed time
+    t_txn = time.time()
     runner = PacmanRunner(opts)
     installed_deps = set()      # 已补装的仓库/AUR 依赖名
                                 # repository/AUR dependencies already installed
@@ -3078,11 +3081,13 @@ def install_transaction(specs, opts):
 
     for attempt in range(1, max_tries + 1):
         pkgnames = " ".join(os.path.basename(s.pkgpath) for s in specs)
+        t_try = time.time()
         log.info(f"\n[安装 {attempt}/{max_tries}] pacman -U {pkgnames}")
         rc, out = runner.install([s.pkgpath for s in specs], overwrite=overwrite_files)
         if rc == 0:
-            log.info("✓ 安装成功")
+            log.info(f"✓ 安装成功 (本轮 {time.time()-t_try:.1f}s, 事务累计 {time.time()-t_txn:.1f}s)")
             return True
+        log.info(f"  失败 (本轮 {time.time()-t_try:.1f}s), 诊断修复后重试")
 
         diag = parse_pacman_failure(out)
 
@@ -3474,7 +3479,12 @@ def convert_one(path: str, opts) -> Optional[str]:
     -i / --dry-run / interactive-prompt keep it for repackaging and main cleans it up
     after the transaction.
     """
-    log.info(f"\n==> 转换: {os.path.basename(path)}")
+    # 批次进度与计时: 头行带 [n/total], 结束时打印单包耗时
+    # batch progress and timing: the header carries [n/total]; per-file elapsed on completion
+    t0 = time.time()
+    batch = getattr(opts, "_batch", (0, 0))
+    head = f" [{batch[0]}/{batch[1]}]" if batch[1] > 1 else ""
+    log.info(f"\n==> 转换{head}: {os.path.basename(path)}")
     opts.translator.reset()
     if not os.path.exists(path):
         log.warn(f"文件不存在: {path}")
@@ -3484,11 +3494,15 @@ def convert_one(path: str, opts) -> Optional[str]:
     handler = HANDLERS.get(fmt)
     if not handler:
         die(f"内部错误: 无 handler for {fmt}")
+    th = time.time()
     try:
         meta, tree_dir, work = handler(path, opts)
     except ValueError as e:
         log.warn(f"解析失败: {e}")
         return None
+    th = time.time() - th
+    nfiles = sum(len(f) for _, _, f in os.walk(tree_dir)) if tree_dir else 0
+    log.info(f"    解包完成: {nfiles} 个文件, 耗时 {th:.1f}s")
 
     # CLI 覆盖
     # CLI overrides
@@ -3566,9 +3580,13 @@ def convert_one(path: str, opts) -> Optional[str]:
         shutil.rmtree(work, ignore_errors=True)
         return pb
 
+    tp = time.time()
     pkgpath = build_pkg_file(meta, tree_dir, outdir, work)
-    log.info(f"    ✓ 成品包: {pkgpath}")
+    tp = time.time() - tp
+    pkgsize = os.path.getsize(pkgpath)
+    log.info(f"    ✓ 成品包: {pkgpath} ({pkgsize/1048576:.1f} MiB, 打包 {tp:.1f}s)")
     log.info(f"      安装: sudo pacman -U {pkgpath}")
+    log.info(f"    ✓ 转换完成: 总耗时 {time.time()-t0:.1f}s")
 
     # 翻译记录 (安装事务模式下同样保留, 便于事后审计)
     # translation report (also kept in install-transaction mode for later audit)
@@ -3740,7 +3758,12 @@ def main():
     # per-file conversion: a single failure is recorded in fail and does not stop the remaining
     # packages
     # (die() inside a handler raises SystemExit; it is caught per file and counted as a failure)
-    for p in args.packages:
+    t_all = time.time()
+    total = len(args.packages)
+    for idx, p in enumerate(args.packages, 1):
+        # 批次序号挂到 opts 上, convert_one 用它打印 [idx/total]
+        # batch index attached to opts; convert_one prints [idx/total] from it
+        args._batch = (idx, total)
         try:
             r = convert_one(p, args)
             if r is None:
@@ -3789,7 +3812,8 @@ def main():
 
     print()
     if not log.quiet:
-        print(f"完成: {len(ok)} 个成功" + (f", {len(fail)} 个失败 {fail}" if fail else ""))
+        print(f"完成: {len(ok)} 个成功" + (f", {len(fail)} 个失败 {fail}" if fail else "")
+              + f", 总耗时 {time.time()-t_all:.1f}s")
         if ok:
             print("提示: 未经校验的第三方包可能带来安全与稳定性问题, 建议拆包审计后使用 (pacman -Qlp 查看内容)")
     return 0 if not fail else 2
