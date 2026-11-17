@@ -49,6 +49,7 @@ alltap app.tar.gz --prefix /usr/local # prefix when there is no system tree (def
 alltap a.deb b.rpm -i                 # install after conversion, multi-package single transaction
 alltap a.deb b.rpm -i --dry-run       # rehearsal: print the install plan, install nothing
 alltap a.deb -i --aur                 # fall back to AUR for missing deps, with confirmation
+alltap pkg.deb --no-verbose           # turn off verbose details (on by default)
 alltap --version                      # show alltap version (= -V)
 alltap --refresh                      # refresh the Arch repo package-name cache
 ```

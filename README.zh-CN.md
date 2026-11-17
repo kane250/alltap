@@ -49,6 +49,7 @@ alltap app.tar.gz --prefix /usr/local # 无系统树的安装前缀 (默认 /opt
 alltap a.deb b.rpm -i                 # 转换后多包单事务安装 (依赖互相满足)
 alltap a.deb b.rpm -i --dry-run       # 预演: 输出安装计划, 不实际执行
 alltap a.deb -i --aur                 # 缺失依赖时查询 AUR, 确认后 yay/paru 补装
+alltap pkg.deb --no-verbose           # 关闭细节输出 (verbose 默认开启)
 alltap --version                      # 显示 alltap 版本 (-V 等价)
 alltap --refresh                      # 刷新 Arch 仓库包名缓存
 ```

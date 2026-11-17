@@ -79,27 +79,29 @@ class Log:
 
     三档输出刻意保持极简, 不引入 logging 模块:
       info  普通进度, -q 时静默
-      verb  细节 (-verbose), 统一缩进 4 空格便于区分层级
+      verb  细节 (默认开启, --no-verbose 关闭), 统一缩进 4 空格便于区分层级
       warn  警告, 走 stderr 且带"警告:"前缀, 不因 -q 之外的原因被吞掉
 
     Global logger (singleton log).
 
     Deliberately minimal instead of the logging module:
-    info = progress (silent with -q), verb = details (--verbose, indented),
+    info = progress (silent with -q), verb = details (on by default, --no-verbose
+    to disable, indented),
     warn = warnings on stderr with a prefix.
     """
 
     def __init__(self):
         self.quiet = False
-        self.verbose = False
+        self.verbose = True
 
     def info(self, msg):
         if not self.quiet:
             print(msg)
 
     def verb(self, msg):
-        # 只有显式 --verbose 才输出, 用于依赖翻译/命令回显等排查信息
-        # printed only with --verbose; used for dependency translation / command echo diagnostics
+        # 默认 verbose 开启, 显示依赖翻译/命令回显等排查信息; --no-verbose 关闭
+        # verbose is on by default and shows dependency translation / command echo
+        # diagnostics; turn it off with --no-verbose
         if self.verbose and not self.quiet:
             print("    " + msg)
 
@@ -3683,8 +3685,10 @@ def main():
     ap.add_argument("--refresh", action="store_true", help="刷新 Arch 仓库包名缓存后退出")
     ap.add_argument("-V", "--version", "--show-version", dest="show_version",
                     action="store_true", help="显示 alltap 版本")
-    ap.add_argument("-q", "--quiet", action="store_true", help="安静模式")
-    ap.add_argument("--verbose", action="store_true", help="显示细节")
+    ap.add_argument("-q", "--quiet", action="store_true",
+                    help="安静模式 (屏蔽进度与 verbose 细节, 只留警告)")
+    ap.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=True,
+                    help="显示细节 (默认开启; --no-verbose 关闭)")
     args = ap.parse_args()
 
     log.quiet = args.quiet
